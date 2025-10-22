@@ -1,4 +1,31 @@
 # TTSDataLoader.py
+"""
+Data loading and preprocessing utilities for TTS training.
+
+This module provides two approaches for loading TTS data:
+
+1. **tf.data pipeline (online)**: Processes audio on-the-fly using TensorFlow operations
+   - Uses pure TF ops for mel-spectrogram computation
+   - Supports dynamic tokenization with HuggingFace tokenizers
+   - Memory-efficient caching and bucketing by sequence length
+   - Suitable for large datasets that don't fit in memory
+
+2. **Offline preprocessing**: Pre-computes all features upfront using librosa/soundfile
+   - Tokenizes all text and computes mel-spectrograms once
+   - Caches mel-spectrograms to disk for faster loading
+   - Parallel processing across CPU cores
+   - Uses Keras Sequence for batch generation
+   - Recommended for datasets that fit in memory
+
+Key features:
+- Configurable audio parameters (sample rate, n_fft, mel bands, etc.)
+- Text tokenization using NLLB or other HuggingFace tokenizers
+- Mel-spectrogram normalization to [-1, 1] range
+- Optional silence trimming
+- Sequence bucketing for efficient batching
+- Multi-worker parallel processing
+"""
+
 import os, math, random, hashlib
 import concurrent.futures
 from dataclasses import dataclass
@@ -17,6 +44,21 @@ import soundfile as sf
 # =========================================================
 @dataclass
 class AudioCfg:
+    """
+    Configuration for audio preprocessing.
+    
+    Attributes:
+        sample_rate (int): Original sample rate to read from files. Default: 22050.
+        target_sample_rate (int): Target sample rate for processing. Default: 22050.
+        n_fft (int): FFT size. Default: 1024.
+        hop_length (int): Hop length for STFT. Default: 256.
+        win_length (int): Window length for STFT. Default: 1024.
+        n_mels (int): Number of mel filter banks. Default: 80.
+        fmin (float): Minimum frequency for mel scale. Default: 0.0.
+        fmax (float, optional): Maximum frequency for mel scale. Default: 8000.0.
+        trim_silence (bool): Whether to trim silence. Default: False.
+        trim_threshold_db (float): Threshold in dB for silence trimming. Default: 60.0.
+    """
     sample_rate: int = 22050
     target_sample_rate: int = 22050
     n_fft: int = 1024
@@ -30,6 +72,17 @@ class AudioCfg:
 
 @dataclass
 class TextCfg:
+    """
+    Configuration for text tokenization.
+    
+    Attributes:
+        pad_id (int): Padding token ID. Default: 1 (NLLB pad).
+        bos_id (int): Beginning-of-sequence token ID. Default: 0 (NLLB bos).
+        eos_id (int): End-of-sequence token ID. Default: 2 (NLLB eos).
+        max_text_len (int): Maximum text length in tokens. Default: 400.
+        lang_code (str): Language code for tokenizer. Default: "eng_Latn" (English).
+            For Persian: "pes_Arab".
+    """
     pad_id: int = 1   # NLLB pad=1
     bos_id: int = 0   # NLLB bos=0
     eos_id: int = 2   # NLLB eos=2
@@ -38,6 +91,18 @@ class TextCfg:
 
 @dataclass
 class PipelineCfg:
+    """
+    Configuration for tf.data pipeline.
+    
+    Attributes:
+        batch_size (int): Batch size. Default: 16.
+        shuffle_buffer (int): Size of shuffle buffer. Default: 1000.
+        num_workers (int): Number of parallel workers. Default: tf.data.AUTOTUNE.
+        bucket_boundaries (tuple): Mel length boundaries for bucketing. 
+            Default: range(200, 2000, 200).
+        bucket_batch_sizes (tuple, optional): Batch sizes per bucket. If None, uses batch_size.
+        drop_remainder (bool): Whether to drop incomplete batches. Default: True.
+    """
     batch_size: int = 16
     shuffle_buffer: int = 1000
     num_workers: int = tf.data.AUTOTUNE
@@ -51,9 +116,21 @@ class PipelineCfg:
 # =========================================================
 # Utils: dB, Trim, Resample (TF)
 def _power_to_db(S, amin=1e-10):
+    """Convert power spectrogram to dB scale."""
     return 10.0 * tf.math.log(tf.maximum(S, amin)) / tf.math.log(tf.constant(10.0, S.dtype))
 
 def _resample_1d_linear(x, sr_in, sr_out):
+    """
+    Resample 1D audio signal using bilinear interpolation.
+    
+    Args:
+        x (tf.Tensor): Input audio of shape (T,).
+        sr_in (int): Input sample rate.
+        sr_out (int): Output sample rate.
+        
+    Returns:
+        tf.Tensor: Resampled audio.
+    """
     T = tf.shape(x)[0]
     new_len = tf.cast(
         tf.round(tf.cast(T, tf.float32) * tf.cast(sr_out, tf.float32) / tf.cast(sr_in, tf.float32)),
@@ -64,6 +141,17 @@ def _resample_1d_linear(x, sr_in, sr_out):
     return tf.reshape(x2, [new_len])
 
 def _maybe_trim(audio, sr, cfg: AudioCfg):
+    """
+    Optionally trim silence from audio signal.
+    
+    Args:
+        audio (tf.Tensor): Audio signal.
+        sr (int): Sample rate.
+        cfg (AudioCfg): Audio configuration.
+        
+    Returns:
+        tf.Tensor: Trimmed or original audio.
+    """
     if not cfg.trim_silence:
         return audio
     energy = tf.math.square(audio)
@@ -85,6 +173,17 @@ def _maybe_trim(audio, sr, cfg: AudioCfg):
 _MEL_CACHE = {}
 _WIN_CACHE = {}
 def _get_mel_and_window(cfg: AudioCfg):
+    """
+    Get or create cached mel filterbank matrix and Hann window.
+    
+    Caches computed values to avoid recomputation on every call.
+    
+    Args:
+        cfg (AudioCfg): Audio configuration.
+        
+    Returns:
+        tuple: (mel_matrix, hann_window) as TensorFlow tensors.
+    """
     mel_key = (cfg.target_sample_rate, cfg.n_fft, cfg.n_mels, cfg.fmin, cfg.fmax)
     mel_mat = _MEL_CACHE.get(mel_key)
     if mel_mat is None:
@@ -110,6 +209,25 @@ def _get_mel_and_window(cfg: AudioCfg):
     return mel_mat, hann_win
 
 def wav_to_logmel_tf(wav_path: tf.Tensor, cfg: AudioCfg) -> tf.Tensor:
+    """
+    Convert WAV file to log-mel spectrogram using TensorFlow operations.
+    
+    Performs:
+    1. Load and decode WAV file
+    2. Convert to mono
+    3. Resample if needed
+    4. Optional silence trimming
+    5. STFT with Hann window
+    6. Mel filterbank application
+    7. Log scaling and normalization to [-1, 1]
+    
+    Args:
+        wav_path (tf.Tensor): Path to WAV file (string tensor).
+        cfg (AudioCfg): Audio configuration.
+        
+    Returns:
+        tf.Tensor: Log-mel spectrogram of shape (num_frames, n_mels), normalized to [-1, 1].
+    """
     mel_mat, hann_win = _get_mel_and_window(cfg)
 
     audio_bytes = tf.io.read_file(wav_path)
@@ -141,6 +259,20 @@ def wav_to_logmel_tf(wav_path: tf.Tensor, cfg: AudioCfg) -> tf.Tensor:
 
 # ====== Text (HF NLLB wrapper) برای مسیر tf.data ======
 class HFTokenizerWrapper:
+    """
+    Wrapper for HuggingFace tokenizers to avoid deprecated API usage.
+    
+    Args:
+        hf_tokenizer (AutoTokenizer): HuggingFace tokenizer instance.
+        text_cfg (TextCfg): Text configuration.
+        
+    Attributes:
+        tok (AutoTokenizer): The wrapped tokenizer.
+        src_lang (str): Source language code.
+        pad_id (int): Padding token ID.
+        eos_id (int): End-of-sequence token ID.
+        max_len (int): Maximum sequence length.
+    """
     def __init__(self, hf_tokenizer: AutoTokenizer, text_cfg: TextCfg):
         self.tok = hf_tokenizer
         # Avoid deprecated attributes (lang_code_to_id / fairseq_tokens_to_ids)
@@ -158,10 +290,29 @@ class HFTokenizerWrapper:
         return ids
 
 def default_text_normalize(txt: tf.Tensor) -> tf.Tensor:
+    """
+    Normalize text by collapsing whitespace.
+    
+    Args:
+        txt (tf.Tensor): Input text string tensor.
+        
+    Returns:
+        tf.Tensor: Normalized text.
+    """
     txt = tf.strings.regex_replace(txt, r"\s+", " ")
     return tf.strings.strip(txt)
 
 def encode_text_dynamic(txt: tf.Tensor, py_tokenize_ids: Callable[[str], List[int]]) -> tf.Tensor:
+    """
+    Encode text to token IDs using a Python tokenizer function.
+    
+    Args:
+        txt (tf.Tensor): Input text string tensor.
+        py_tokenize_ids (Callable): Python function that tokenizes text to list of IDs.
+        
+    Returns:
+        tf.Tensor: Token IDs as 1D int32 tensor.
+    """
     ids = tf.py_function(
         func=lambda s: tf.constant(py_tokenize_ids(s.numpy().decode("utf-8")), dtype=tf.int32),
         inp=[txt],
@@ -355,11 +506,19 @@ def build_dataset_pre_tokenized(
 # =========================================================
 def load_ljspeech_items(root_dir: str, metadata_name: str = "metadata.csv") -> List[Tuple[str, str]]:
     """
-    ساختار استاندارد LJSpeech:
-      root_dir/
-        wavs/*.wav
-        metadata.csv  (pipe-delimited: <id>|<transcript>|<normalized>)
-    خروجی: [(wav_path, text), ...]  متن: ستون دوم (transcript)
+    Load LJSpeech-style dataset metadata.
+    
+    Expected directory structure:
+        root_dir/
+            wavs/*.wav
+            metadata.csv  (pipe-delimited: <id>|<transcript>|<normalized>)
+    
+    Args:
+        root_dir (str): Root directory containing wavs/ and metadata.csv.
+        metadata_name (str): Name of metadata file. Default: "metadata.csv".
+        
+    Returns:
+        list: List of (wav_path, transcript) tuples.
     """
     meta_path = os.path.join(root_dir, metadata_name)
     items: List[Tuple[str, str]] = []
@@ -380,6 +539,22 @@ def _trim_silence_librosa(y: np.ndarray, sr: int, enable: bool, top_db: float):
     return yt
 
 def wav_to_logmel_np(path: str, cfg: AudioCfg) -> np.ndarray:
+    """
+    Convert WAV file to log-mel spectrogram using librosa (NumPy-based).
+    
+    Performs high-quality offline processing with librosa:
+    - Resampling with soxr_hq or kaiser_best
+    - Optional silence trimming
+    - Mel-spectrogram computation
+    - Log scaling and normalization to [-1, 1]
+    
+    Args:
+        path (str): Path to WAV file.
+        cfg (AudioCfg): Audio configuration.
+        
+    Returns:
+        np.ndarray: Log-mel spectrogram of shape (num_frames, n_mels), dtype float32.
+    """
     y, sr = sf.read(path)  # y: (T,) or (T, C)
     if y.ndim == 2:
         y = y.mean(axis=1)
@@ -470,8 +645,28 @@ def preprocess_dataset(
     cache_dir: Optional[str] = None,
 ):
     """
-    Offline preprocessing (tokenize + wav→mel) with optional parallel mel computation.
-    num_workers: if None, uses max(1, os.cpu_count()-1). Set to 1 to disable parallelism.
+    Offline preprocessing: tokenize text and compute mel-spectrograms in parallel.
+    
+    Processes all audio files and text upfront, with optional disk caching for
+    mel-spectrograms to speed up subsequent runs. Uses multiprocessing for
+    parallel mel computation across CPU cores.
+    
+    Args:
+        root_dir (str): Root directory containing dataset (LJSpeech format).
+        audio_cfg (AudioCfg): Audio configuration.
+        text_cfg (TextCfg): Text configuration.
+        tok (AutoTokenizer): HuggingFace tokenizer instance.
+        metadata_name (str): Name of metadata file. Default: "metadata.csv".
+        num_workers (int, optional): Number of parallel workers. If None, uses cpu_count()-1.
+            Set to 1 to disable parallelism.
+        cache_dir (str, optional): Directory for caching mel-spectrograms. If None, no caching.
+        
+    Returns:
+        tuple: (items, text_ids, mels, mel_lens) where:
+            items: List of (wav_path, text) tuples
+            text_ids: List of tokenized text arrays
+            mels: List of mel-spectrogram arrays
+            mel_lens: Array of mel frame counts
     """
     items = load_ljspeech_items(root_dir, metadata_name=metadata_name)
     text_ids = tokenize_texts(items, tok, text_cfg)
@@ -538,8 +733,25 @@ def _shift_right_mel_np(mel_batch):
 
 class TTSDataset(tf.keras.utils.Sequence):
     """
-    text_ids_list:  list[list[int]]    (طول‌های مختلف)
-    mels_list:      list[np.ndarray]   هر mel با شکل (T, n_mels)
+    Keras Sequence for TTS training with offline-preprocessed data.
+    
+    Provides batched data with teacher forcing (right-shifted mel input).
+    Supports shuffling and automatic padding to fixed or maximum lengths.
+    
+    Args:
+        text_ids_list (list): List of token ID arrays (variable length).
+        mels_list (list): List of mel-spectrogram arrays, shape (T, n_mels).
+        batch_size (int): Batch size.
+        pad_id (int): Padding token ID for text.
+        n_mels (int): Number of mel-spectrogram bands.
+        max_src_len (int): Maximum source sequence length (text will be truncated/padded).
+        max_mel_len (int): Maximum mel sequence length (mel will be truncated/padded).
+        shuffle (bool): Whether to shuffle data between epochs. Default: True.
+        
+    Returns:
+        Batches of (inputs, targets) where:
+            inputs: dict with keys 'enc_ids', 'dec_mel', 'mel_len'
+            targets: dict with keys 'mel_pre', 'mel_post', 'stop'
     """
     def __init__(self,
                  text_ids_list,
