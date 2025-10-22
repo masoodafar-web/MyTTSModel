@@ -139,10 +139,10 @@ from MyTTSModel import TransformerTTS
 
 core_path = "checkpoints/tts_core_last.weights.h5"
 # مدل را با اندازه واژگان len(tokenizer) می‌سازیم تا added tokens را پوشش دهد
-D_MODEL = 256
-NUM_LAYERS = 6
+NUM_LAYERS = 12
+D_MODEL = 512
+DFF = 2024
 NUM_HEADS = 8
-DFF = 1024
 with strategy.scope():
     model_core = TransformerTTS(
         num_layers=NUM_LAYERS, d_model=D_MODEL, num_heads=NUM_HEADS, dff=DFF,
@@ -158,10 +158,10 @@ with strategy.scope():
         except Exception as e:
             print("⚠️ Failed to load weights strictly:", e)
             try:
-                model_core.load_weights(core_path, by_name=True, skip_mismatch=True)
-                print("✅ Weights loaded by_name with skip_mismatch.")
+                model_core.load_weights(core_path, skip_mismatch=True)
+                print("✅ Weights loaded with skip_mismatch.")
             except Exception as e2:
-                print("⚠️ Skipped loading weights due to shape mismatch:", e2)
+                print("⚠️ Skipped loading weights due to mismatch:", e2)
     else:
         print("⚠️ Checkpoint not found:", core_path)
 
@@ -178,6 +178,8 @@ class TTSLearner(tf.keras.Model):
         # Guided Attention
         self.ga_weight = float(ga_weight)
         self.ga_sigma = float(ga_sigma)
+        # وزن GAL به‌صورت متغیر تا در طول آموزش ramp شود
+        self.ga_weight_var = tf.Variable(self.ga_weight, trainable=False, dtype=tf.float32, name="ga_weight")
 
         # Metrics
         self.train_loss = tf.keras.metrics.Mean(name="loss")
@@ -229,6 +231,17 @@ class TTSLearner(tf.keras.Model):
         den  = tf.reduce_sum(mask) + 1e-8
         return num / den
 
+    @staticmethod
+    def _masked_mae_mean_per_band(y_true, y_pred, mask):
+        """میانگین L1 روی محور مل برای خواناییِ متریک، سپس ماسک فریم.
+        توجه: فقط برای متریک استفاده می‌شود؛ لُس اصلی تغییر نمی‌کند."""
+        mask = tf.cast(mask, y_pred.dtype)                        # (B,T,1) یا (B,T,80)
+        diff = tf.abs(y_pred - y_true)
+        diff = tf.reduce_mean(diff, axis=-1, keepdims=True)       # (B,T,1)
+        num  = tf.reduce_sum(diff * mask)
+        den  = tf.reduce_sum(mask) + 1e-8
+        return num / den
+
     def _weighted_bce_logits(self, y_true, logits, stop_mask):
         # y_true: (B,T,1) | logits: (B,T,1) | stop_mask: (B,T)
         y_true = tf.cast(y_true, tf.float32)
@@ -255,12 +268,22 @@ class TTSLearner(tf.keras.Model):
         return num / den
 
     @staticmethod
-    def _within_eps_db(y_true, y_pred, frame_mask, eps=0.1):
-        """در صورتی که روی dB نیستی eps=0.1 مناسب‌تره؛ اگر dB هستی، eps~2.0 بذار."""
-        err = tf.reduce_mean(tf.abs(y_pred - y_true), axis=-1)    # (B,T)
-        mask2 = tf.squeeze(tf.cast(frame_mask, tf.float32), -1)   # (B,T)
-        good = tf.cast(err <= eps, tf.float32) * mask2
-        return tf.reduce_sum(good) / (tf.reduce_sum(mask2) + 1e-8)
+    def _within_eps_db(y_true, y_pred, frame_mask, eps=2.0):
+        """درصد بن‌های مِل که در بازه eps dB هستند، روی همه فریم‌های معتبر.
+        فقط برای متریک (بدون اثر روی آموزش)."""
+        # اطمینان از محدودهٔ ورودی‌ها برای تبدیل dB
+        x_t = tf.clip_by_value(tf.cast(y_true, tf.float32), -1.0, 1.0)
+        x_p = tf.clip_by_value(tf.cast(y_pred, tf.float32), -1.0, 1.0)
+        to_db = lambda x: ((x + 1.0) * 0.5) * 100.0 - 100.0
+        t_db = to_db(x_t)                       # (B,T,M)
+        p_db = to_db(x_p)                       # (B,T,M)
+        diff_db = tf.abs(p_db - t_db)           # (B,T,M)
+        # ماسک فریم‌ها و نرمال‌سازی بر تعداد بن‌ها
+        mask_bt1 = tf.cast(frame_mask, tf.float32)                  # (B,T,1)
+        good_btm = tf.cast(diff_db <= eps, tf.float32) * mask_bt1   # (B,T,M)
+        num = tf.reduce_sum(good_btm)
+        den = tf.reduce_sum(mask_bt1) * tf.cast(tf.shape(diff_db)[-1], tf.float32) + 1e-8
+        return num / den
 
     def _assert_shift_ok(self, inputs, targets):
         # چک سبک: dec_mel باید شیفت y باشد (dec[:,1] ≈ y[:,0])
@@ -280,14 +303,17 @@ class TTSLearner(tf.keras.Model):
             message="[assert] Decoder input must be right-shifted targets."
         )
 
-    # ---------- Guided Attention Loss ----------
-    def _guided_attn_loss(self, attn, enc_ids, mel_len, sigma=0.2):
-        # attn: (B, T_dec, S_enc) softmax weights
-        # enc_ids: (B, S_enc) to infer enc_len via pad_id
-        # mel_len: (B,) int32
+    # ---------- Guided Attention Terms ----------
+    def _guided_attn_terms(self, attn, enc_ids, mel_len, sigma=0.2):
+        """
+        برمی‌گرداند:
+          - ga_loss: فرمول کلاسیک GAL نرمال‌شده روی T×S (کوچک است)
+          - ga_metric: میانگین پنالتی فقط روی زمان (B,T) → [0..1] برای نمایش بهتر
+        """
         if attn is None:
-            return tf.constant(0.0, tf.float32)
-        attn = tf.cast(attn, tf.float32)
+            z = tf.constant(0.0, tf.float32)
+            return z, z
+        attn = tf.cast(attn, tf.float32)  # (B,T,S)
 
         B = tf.shape(attn)[0]
         T = tf.shape(attn)[1]
@@ -303,19 +329,25 @@ class TTSLearner(tf.keras.Model):
         s_idx = tf.cast(tf.range(S)[None, None, :], tf.float32)  # (1,1,S)
         t_norm = t_idx / tf.maximum(tf.cast(dec_len[:, None, None], tf.float32) - 1.0, 1.0)  # (B,T,1)
         s_norm = s_idx / tf.maximum(tf.cast(enc_len[:, None, None], tf.float32) - 1.0, 1.0)  # (B,1,S)
-        # penalty mask: 1 - exp(-(t-s)^2 / (2*sigma^2))
         diff = t_norm - s_norm  # (B,T,S)
-        g2 = 2.0 * (sigma ** 2)
-        W = 1.0 - tf.exp(- (diff * diff) / g2)
+        W = 1.0 - tf.exp(- (diff * diff) / (2.0 * (sigma ** 2)))  # (B,T,S)
 
-        # mask out padding positions
-        dec_mask = tf.sequence_mask(dec_len, maxlen=T, dtype=tf.float32)[:, :, None]  # (B,T,1)
-        enc_mask = tf.sequence_mask(enc_len, maxlen=S, dtype=tf.float32)[:, None, :]  # (B,1,S)
-        mask = dec_mask * enc_mask  # (B,T,S)
+        # masks
+        dec_mask_bt = tf.sequence_mask(dec_len, maxlen=T, dtype=tf.float32)  # (B,T)
+        enc_mask_bs = tf.sequence_mask(enc_len, maxlen=S, dtype=tf.float32)  # (B,S)
+        mask_bts = dec_mask_bt[:, :, None] * enc_mask_bs[:, None, :]        # (B,T,S)
 
-        num = tf.reduce_sum(W * attn * mask)
-        den = tf.reduce_sum(mask) + 1e-8
-        return num / den
+        # classic GA loss normalized over T×S
+        num = tf.reduce_sum(W * attn * mask_bts)
+        den = tf.reduce_sum(mask_bts) + 1e-8
+        ga_loss = num / den
+
+        # time-averaged metric: sum_s W*A in [0,1], average over valid T
+        attn_penalty_bt = tf.reduce_sum(W * attn, axis=-1)                  # (B,T)
+        num_m = tf.reduce_sum(attn_penalty_bt * dec_mask_bt)
+        den_m = tf.reduce_sum(dec_mask_bt) + 1e-8
+        ga_metric = num_m / den_m
+        return ga_loss, ga_metric
 
     def call(self, inputs, training=False):
         x = inputs
@@ -348,16 +380,17 @@ class TTSLearner(tf.keras.Model):
             stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
 
             # --- Losses (ماسک‌دار)
-            l1_pre  = self._masked_mae(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
-            l1_post = self._masked_mae(targets["mel_post"], outputs["mel_post"], frame_mask)
+            # برای سازگاری با متریک‌ها، لُس را هم به میانگین هر باند تبدیل می‌کنیم
+            l1_pre_loss  = self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
+            l1_post_loss = self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
             bce_stop= self._weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
 
-            ga = self._guided_attn_loss(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
+            ga_loss, ga_vis = self._guided_attn_terms(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
             loss = (
-                self.loss_weights["mel_pre"]  * l1_pre +
-                self.loss_weights["mel_post"] * l1_post +
+                self.loss_weights["mel_pre"]  * l1_pre_loss +
+                self.loss_weights["mel_post"] * l1_post_loss +
                 self.loss_weights["stop"]     * bce_stop +
-                self.ga_weight * ga
+                tf.cast(self.ga_weight_var, tf.float32) * ga_loss
             )
 
         grads = tape.gradient(loss, self.trainable_variables)
@@ -365,10 +398,12 @@ class TTSLearner(tf.keras.Model):
 
         # --- Metrics
         self.train_loss.update_state(loss)
-        self.mae_pre.update_state(l1_pre)
-        self.mae_post.update_state(l1_post)
+        l1_pre_mean  = self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
+        l1_post_mean = self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
+        self.mae_pre.update_state(l1_pre_mean)
+        self.mae_post.update_state(l1_post_mean)
         self.bce_stop.update_state(bce_stop)
-        self.ga_metric.update_state(ga)
+        self.ga_metric.update_state(ga_vis)
 
         # BinaryAccuracy با ماسک stop
         stop_prob   = tf.sigmoid(outputs["stop"])                                 # (B,T,1)
@@ -377,12 +412,12 @@ class TTSLearner(tf.keras.Model):
         self.stop_acc.update_state(y_true_stop, y_pred_stop, sample_weight=stop_mask)
 
         # within-ε
-        self.within2db.update_state(self._within_eps_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=0.1))
+        self.within2db.update_state(self._within_eps_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=2.0))
 
         return {
             "loss": self.train_loss.result(),
-            "l1_pre": self.mae_pre.result(),
-            "l1_post": self.mae_post.result(),
+            "l1_pre": self.mae_pre.result(),   # میانگین هر باند
+            "l1_post": self.mae_post.result(), # میانگین هر باند
             "bce_stop": self.bce_stop.result(),
             "stop_acc": self.stop_acc.result(),
             "within2db": self.within2db.result(),
@@ -402,16 +437,16 @@ class TTSLearner(tf.keras.Model):
         frame_mask = self._frame_mask_from_targets(targets)   # (B,T,1)
         stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
 
-        l1_pre  = self._masked_mae(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
-        l1_post = self._masked_mae(targets["mel_post"], outputs["mel_post"], frame_mask)
+        l1_pre_loss  = self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
+        l1_post_loss = self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
         bce_stop= self._weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
 
-        ga = self._guided_attn_loss(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
+        ga_loss, ga_vis = self._guided_attn_terms(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
         loss = (
-            self.loss_weights["mel_pre"]  * l1_pre +
-            self.loss_weights["mel_post"] * l1_post +
+            self.loss_weights["mel_pre"]  * l1_pre_loss +
+            self.loss_weights["mel_post"] * l1_post_loss +
             self.loss_weights["stop"]     * bce_stop +
-            self.ga_weight * ga
+            tf.cast(self.ga_weight_var, tf.float32) * ga_loss
         )
 
         self.val_loss.update_state(loss)
@@ -424,17 +459,17 @@ class TTSLearner(tf.keras.Model):
         val_stop_acc = tf.reduce_sum(correct * stop_mask) / (tf.reduce_sum(stop_mask) + 1e-8)
 
         # within-ε
-        val_within2db = self._within_eps_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=0.1)
+        val_within2db = self._within_eps_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=2.0)
 
         # کلیدها بدون پیشوند "val_" برگردند؛ Keras خودش val_ اضافه می‌کند
         return {
             "loss": self.val_loss.result(),
-            "l1_pre": l1_pre,
-            "l1_post": l1_post,
+            "l1_pre": self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask),
+            "l1_post": self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask),
             "bce_stop": bce_stop,
             "stop_acc": val_stop_acc,
             "within2db": val_within2db,
-            "gal": ga,
+            "gal": ga_vis,
         }
 
 # ---- Optimizer / LR schedule
@@ -515,7 +550,31 @@ ckpt_learner = tf.keras.callbacks.ModelCheckpoint(
     monitor="val_loss", mode="min", verbose=1
 )
 
-callbacks = [EMAAndSaveCore(decay=0.999, core_path=core_path), ckpt_learner, tb, early]
+class GAWeightRamp(tf.keras.callbacks.Callback):
+    def __init__(self, start=0.0, target=0.2, ramp_epochs=3):
+        super().__init__()
+        self.start = float(start)
+        self.target = float(target)
+        self.ramp_epochs = int(ramp_epochs)
+
+    def on_train_begin(self, logs=None):
+        try:
+            self.model.ga_weight_var.assign(tf.cast(self.start, tf.float32))
+        except Exception:
+            pass
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if self.ramp_epochs <= 0:
+            w = self.target
+        else:
+            p = min(1.0, max(0.0, (epoch + 1) / float(self.ramp_epochs)))
+            w = self.start + (self.target - self.start) * p
+        try:
+            self.model.ga_weight_var.assign(tf.cast(w, tf.float32))
+        except Exception:
+            pass
+
+callbacks = [GAWeightRamp(start=0.0, target=0.2, ramp_epochs=3), EMAAndSaveCore(decay=0.999, core_path=core_path), ckpt_learner, tb, early]
 
 print("Fitting ...")
 val_data = val_gen if len(val_gen) > 0 else None

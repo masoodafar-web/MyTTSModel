@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MyTTSModel – مستند معماری و فرایند</title>
+  <style>
+    :root {
+      --bg: #0f1115; --fg: #e9eef3; --muted: #a9b4c2; --accent:#55c1ff;
+      --card:#161a22; --line:#2a3140; --good:#3ddc97; --warn:#ffc857; --bad:#ff6b6b;
+    }
+    html,body{background:var(--bg);color:var(--fg);font-family: Inter, Vazirmatn, Segoe UI, Roboto, sans-serif;}
+    a{color:var(--accent);text-decoration:none}
+    h1,h2,h3{margin:0.6rem 0;}
+    h1{font-size:1.8rem}
+    h2{font-size:1.25rem;border-right:4px solid var(--accent);padding-right:10px}
+    h3{font-size:1.1rem;color:var(--muted)}
+    .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:16px 0}
+    .muted{color:var(--muted)}
+    .grid{display:grid;gap:16px}
+    .grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+    code, .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;direction:ltr}
+    ul{margin:8px 0 8px 18px}
+    .toc a{display:block;padding:6px 0;border-bottom:1px dashed var(--line)}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#223047;color:#b9d8ff}
+    .diagram{overflow-x:auto;-webkit-overflow-scrolling:touch;padding:8px;border-radius:10px;background:#0c0f14;border:1px solid var(--line)}
+    .diagram svg{display:block;max-width:100%;height:auto}
+    .svg-medium{min-width:820px}
+    .svg-wide{min-width:980px}
+    .small{font-size:0.9rem}
+    @media (max-width: 900px){
+      .grid.cols-2{grid-template-columns:1fr}
+      h1{font-size:1.5rem}
+      h2{font-size:1.1rem}
+      .tx{font-size:12px}
+      .card{padding:12px}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MyTTSModel – مستند معماری، فلو و آموزش</h1>
+    <p class="muted">این صفحه، معماری مدل TTS، جریان داده، لُس‌ها/متریک‌ها، آموزش و اینفرنس را توضیح می‌دهد. شامل چند دیاگرام SVG برای درک سریع.</p>
+
+    <div class="card toc">
+      <h2>فهرست</h2>
+      <a href="#overview">مرور کلی</a>
+      <a href="#data">جریان داده و پیش‌پردازش</a>
+      <a href="#arch">معماری مدل</a>
+      <a href="#train">آموزش، لُس‌ها و متریک‌ها</a>
+      <a href="#infer">اینفرنس و تبدیل به موج</a>
+      <a href="#config">پیکربندی‌های جاری</a>
+      <a href="#files">نگاشت فایل‌ها</a>
+    </div>
+
+    <section id="overview" class="card">
+      <h2>مرور کلی</h2>
+      <ul>
+        <li>ورودی متن توکن‌شده (NLLB) و mel قبلی (teacher forcing) → خروجی mel پیش‌بینی‌شده (pre/post) و احتمال توقف.</li>
+        <li>Encoder/Decoder ترنسفورمر، PostNet کانولوشنی، Mixed Precision و پشتیبانی چند GPU (MirroredStrategy).</li>
+        <li>لُس‌ها: L1(mel_pre/post) با <span class="badge">میانگین هر باند مِل</span>، BCE توقف با وزن‌دهی پویا، و Guided Attention Loss (GAL) با ramp-up.</li>
+        <li>بهینه‌سازی Adam + Noam LR؛ EMA وزن‌ها و EarlyStopping؛ کش و موازی‌سازی محاسبهٔ مِل.</li>
+      </ul>
+    </section>
+
+    <section id="data" class="card">
+      <h2>جریان داده و پیش‌پردازش</h2>
+      <div class="grid cols-2">
+        <div>
+          <h3>مراحل</h3>
+          <ul>
+            <li>Tokenize با <span class="mono">AutoTokenizer(NLLB)</span> و <span class="mono">src_lang</span> مناسب؛ <span class="badge">input_vocab_size=len(tok)</span>.</li>
+            <li>WAV → Log-Mel با <span class="mono">n_fft=1024</span>، <span class="mono">hop=256</span>، <span class="mono">n_mels=80</span>، <span class="mono">sr=16000</span>؛ کش روی دیسک.</li>
+            <li>Batch ثابت با برش/پد تا <span class="mono">MAX_SRC_LEN</span> و <span class="mono">MAX_MEL_LEN</span>؛ <span class="mono">dec_mel</span> = شیفت راست mel.</li>
+          </ul>
+          <p class="small muted">پوشهٔ کش: <span class="mono">checkpoints/mel_cache</span></p>
+        </div>
+        <div>
+          <h3>دیاگرام جریان داده</h3>
+          <div class="diagram"><svg class="svg-medium" viewBox="0 0 820 260" role="img" aria-label="Data flow">
+            <defs>
+              <style>
+                .bx{fill:#111722;stroke:#2a3140;stroke-width:1.2}
+                .tx{fill:#e9eef3;font:14px/1.4 ui-monospace,Menlo,Consolas}
+                .ar{stroke:#4aa3ff;stroke-width:1.6;marker-end:url(#m)}
+              </style>
+              <marker id="m" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#4aa3ff"/>
+              </marker>
+            </defs>
+            <rect class="bx" x="10" y="30" width="190" height="80" rx="10"/>
+            <text class="tx" x="20" y="55">WAV + متن</text>
+            <text class="tx" x="20" y="80">(LJSpeech-like)</text>
+
+            <rect class="bx" x="220" y="18" width="220" height="104" rx="10"/>
+            <text class="tx" x="230" y="46">Tokenize (NLLB)</text>
+            <text class="tx" x="230" y="70">len(tok) ، src_lang</text>
+            <text class="tx" x="230" y="94">Pad/Trunc تا MAX_SRC_LEN</text>
+
+            <rect class="bx" x="220" y="140" width="220" height="100" rx="10"/>
+            <text class="tx" x="230" y="168">WAV → Log-Mel</text>
+            <text class="tx" x="230" y="192">n_fft=1024, hop=256</text>
+            <text class="tx" x="230" y="216">Pad/Trunc تا MAX_MEL_LEN</text>
+
+            <rect class="bx" x="470" y="70" width="330" height="100" rx="10"/>
+            <text class="tx" x="480" y="98">Batch ثابت</text>
+            <text class="tx" x="480" y="122">enc_ids, dec_mel(shift), mel, mel_len</text>
+
+            <line class="ar" x1="200" y1="70" x2="220" y2="70"/>
+            <line class="ar" x1="200" y1="70" x2="220" y2="190"/>
+            <line class="ar" x1="440" y1="70" x2="470" y2="120"/>
+            <line class="ar" x1="440" y1="190" x2="470" y2="120"/>
+          </svg></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="arch" class="card">
+      <h2>معماری مدل</h2>
+      <div class="grid cols-2">
+        <div>
+          <h3>اجزا</h3>
+          <ul>
+            <li><b>Encoder</b>: توکن امبدینگ + positional؛ L لایه Attention/FFN (Pre-Norm).</li>
+            <li><b>DecoderTTS</b>: Mel prenet + positional؛ causal self-attn + cross-attn به Encoder.</li>
+            <li><b>Heads</b>: Dense→<span class="mono">mel_head</span> (pre)، Dense→<span class="mono">stop_head</span> (logits).</li>
+            <li><b>PostNet</b>: 4×(Conv+BN+tanh+Dropout) + ConvOut → residual روی mel_pre.</li>
+            <li><b>go_frame</b>: فریم قابل‌ یادگیری برای شروع اینفرنس.</li>
+            <li><b>Masks</b>: key padding و causal ترکیبی؛ بازگردانی attn آخرین بلاک برای GAL.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>دیاگرام معماری</h3>
+          <div class="diagram"><svg class="svg-wide" viewBox="0 0 980 360" role="img" aria-label="Architecture">
+            <defs>
+              <style>
+                .bx{fill:#111722;stroke:#2a3140;stroke-width:1.2}
+                .tx{fill:#e9eef3;font:14px/1.4 ui-monospace,Menlo,Consolas}
+                .ar{stroke:#4aa3ff;stroke-width:1.6;marker-end:url(#m2)}
+                .ar2{stroke:#6ee7b7;stroke-width:1.4;marker-end:url(#m3)}
+              </style>
+              <marker id="m2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#4aa3ff"/>
+              </marker>
+              <marker id="m3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#6ee7b7"/>
+              </marker>
+            </defs>
+            <rect class="bx" x="10" y="30" width="200" height="60" rx="10"/>
+            <text class="tx" x="20" y="60">enc_ids (B,S)</text>
+
+            <rect class="bx" x="10" y="120" width="200" height="60" rx="10"/>
+            <text class="tx" x="20" y="150">dec_mel (B,T,80)</text>
+
+            <rect class="bx" x="240" y="30" width="190" height="60" rx="10"/>
+            <text class="tx" x="250" y="60">Encoder</text>
+
+            <rect class="bx" x="240" y="120" width="220" height="60" rx="10"/>
+            <text class="tx" x="250" y="150">Mel Prenet + PosEnc</text>
+
+            <rect class="bx" x="500" y="120" width="210" height="60" rx="10"/>
+            <text class="tx" x="510" y="150">Decoder (Self + Cross)</text>
+
+            <rect class="bx" x="740" y="100" width="210" height="50" rx="10"/>
+            <text class="tx" x="750" y="128">mel_head → mel_pre</text>
+
+            <rect class="bx" x="740" y="160" width="210" height="50" rx="10"/>
+            <text class="tx" x="750" y="188">stop_head → logits</text>
+
+            <rect class="bx" x="740" y="220" width="210" height="60" rx="10"/>
+            <text class="tx" x="750" y="252">PostNet (+ residual)</text>
+
+            <text class="tx" x="770" y="300">خروجی: mel_post</text>
+
+            <line class="ar" x1="210" y1="60" x2="240" y2="60"/>
+            <line class="ar" x1="210" y1="150" x2="240" y2="150"/>
+            <line class="ar" x1="430" y1="60" x2="500" y2="150"/>
+            <line class="ar" x1="460" y1="150" x2="500" y2="150"/>
+            <line class="ar" x1="710" y1="150" x2="740" y2="125"/>
+            <line class="ar" x1="710" y1="150" x2="740" y2="185"/>
+            <line class="ar2" x1="740" y1="125" x2="845" y2="250"/>
+          </svg></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="train" class="card">
+      <h2>آموزش، لُس‌ها و متریک‌ها</h2>
+      <div class="grid cols-2">
+        <div>
+          <h3>لُس‌ها</h3>
+          <ul>
+            <li><b>L1(mel_pre)</b> و <b>L1(mel_post)</b>: MAE ماسک‌دار با <span class="badge">میانگین هر باند مِل</span>.</li>
+            <li><b>Stop BCE</b>: وزن‌دهی پویا <span class="mono">pos_weight = neg/pos</span> روی فریم‌های معتبر.</li>
+            <li><b>Guided Attention Loss</b>: پنالتی قطری با <span class="mono">sigma</span>؛ ramp-up وزن در اپوک‌های ابتدایی.</li>
+          </ul>
+          <h3>متریک‌ها</h3>
+          <ul>
+            <li><b>gal</b>: میانگین زمانی پنالتی توجه (۰..۱) برای نمایش واضح‌تر روند هم‌ترازی.</li>
+            <li><b>within2db</b>: درصد بن‌های مِل با خطای ≤ ۲ dB روی همهٔ فریم‌های معتبر.</li>
+            <li><b>stop_acc</b>: دقت باینری وزن‌دار روی ماسک توقف.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>فلوچارت آموزش</h3>
+          <div class="diagram"><svg class="svg-wide" viewBox="0 0 980 420" role="img" aria-label="Training flow">
+            <defs>
+              <style>
+                .bx{fill:#111722;stroke:#2a3140;stroke-width:1.2}
+                .tx{fill:#e9eef3;font:13px/1.4 ui-monospace,Menlo,Consolas}
+                .ar{stroke:#4aa3ff;stroke-width:1.6;marker-end:url(#m4)}
+              </style>
+              <marker id="m4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#4aa3ff"/>
+              </marker>
+            </defs>
+            <rect class="bx" x="20" y="30" width="220" height="60" rx="10"/>
+            <text class="tx" x="30" y="65">Batch: enc_ids, dec_mel, mel, mel_len</text>
+            <line class="ar" x1="240" y1="60" x2="280" y2="60"/>
+
+            <rect class="bx" x="280" y="30" width="220" height="60" rx="10"/>
+            <text class="tx" x="290" y="65">Forward (core)</text>
+            <line class="ar" x1="500" y1="60" x2="540" y2="60"/>
+
+            <rect class="bx" x="540" y="15" width="200" height="60" rx="10"/>
+            <text class="tx" x="550" y="50">L1 mel_pre/post</text>
+            <rect class="bx" x="540" y="85" width="200" height="60" rx="10"/>
+            <text class="tx" x="550" y="120">Stop BCE (weighted)</text>
+            <rect class="bx" x="540" y="155" width="200" height="60" rx="10"/>
+            <text class="tx" x="550" y="190">GAL (diag penalty)</text>
+            <line class="ar" x1="740" y1="45" x2="780" y2="105"/>
+            <line class="ar" x1="740" y1="115" x2="780" y2="115"/>
+            <line class="ar" x1="740" y1="185" x2="780" y2="125"/>
+
+            <rect class="bx" x="780" y="95" width="180" height="60" rx="10"/>
+            <text class="tx" x="790" y="130">Weighted Sum → Loss</text>
+            <line class="ar" x1="870" y1="155" x2="870" y2="210"/>
+
+            <rect class="bx" x="760" y="210" width="220" height="60" rx="10"/>
+            <text class="tx" x="770" y="245">Adam + Noam LR + clipnorm</text>
+            <line class="ar" x1="870" y1="270" x2="870" y2="320"/>
+
+            <rect class="bx" x="730" y="320" width="280" height="70" rx="10"/>
+            <text class="tx" x="740" y="350">به‌روزرسانی وزن‌ها + EMA snapshot + Checkpoint</text>
+          </svg></div>
+        </div>
+      </div>
+      <p class="small muted">Callbacks: <span class="mono">GAWeightRamp(0→0.2/3ep)</span>، <span class="mono">EMA</span>، <span class="mono">ModelCheckpoint</span>، <span class="mono">EarlyStopping</span>، <span class="mono">TensorBoard</span></p>
+    </section>
+
+    <section id="infer" class="card">
+      <h2>اینفرنس و تبدیل به موج</h2>
+      <ul>
+        <li>ساخت مدل با <span class="badge">input_vocab_size=len(tok)</span> و <span class="mono">PAD_ID=tok.pad_token_id</span>.</li>
+        <li>لود وزن‌ها: اولویت با <span class="mono">tts_core_ema_last.weights.h5</span>؛ در صورت نیاز <span class="mono">skip_mismatch=True</span>.</li>
+        <li><b>greedy_generate_fast</b>: تکرار فریم‌ها با go-frame تا معیار توقف؛ خروجی <span class="mono">mel_post</span>.</li>
+        <li>Denorm مل به dB و سپس توان؛ شبه‌وارون مَپ مِل → خطی و Griffin-Lim برای بازسازی موج.</li>
+      </ul>
+    </section>
+
+    <section id="config" class="card">
+      <h2>پیکربندی‌های جاری</h2>
+      <div class="grid cols-2">
+        <div>
+          <h3>هایپرپارامترها</h3>
+          <ul>
+            <li>Encoder/Decoder: <span class="mono">num_layers=6</span>، <span class="mono">d_model=256</span>، <span class="mono">num_heads=8</span>، <span class="mono">dff=1024</span></li>
+            <li>Audio: <span class="mono">sr=16000</span>، <span class="mono">n_fft=1024</span>، <span class="mono">hop=256</span>، <span class="mono">n_mels=80</span>, <span class="mono">fmax=8000</span></li>
+            <li>Lengths: <span class="mono">MAX_SRC_LEN≈</span>صدک ۹۹ متن، <span class="mono">MAX_MEL_LEN≈</span>صدک ۹۹ مِل</li>
+          </ul>
+        </div>
+        <div>
+          <h3>بهینه‌سازی</h3>
+          <ul>
+            <li>Adam + Noam LR (warmup=~8×steps/epoch)، <span class="mono">clipnorm=1.0</span></li>
+            <li>Mixed Precision (<span class="mono">mixed_float16</span>)</li>
+            <li>MirroredStrategy برای چند GPU</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="files" class="card">
+      <h2>نگاشت فایل‌ها</h2>
+      <ul>
+        <li><span class="mono">MyTTSModel.py</span>: تعریف Encoder/Decoder/PostNet/TransformerTTS و اینفرنس.</li>
+        <li><span class="mono">MyTTSModelTrain.py</span>: آماده‌سازی داده، Learner سفارشی، لُس‌ها/متریک‌ها، کال‌بک‌ها.</li>
+        <li><span class="mono">TTSDataLoader.py</span>: پیش‌پردازش آفلاین، کش مِل، کلاس <span class="mono">TTSDataset</span>.</li>
+        <li><span class="mono">MyModelInfrence.ipynb</span>: ساخت مدل، لود وزن‌ها، اینفرنس، رسم مل و WAV.</li>
+      </ul>
+    </section>
+
+    <p class="muted small">© مستند داخلی پروژهٔ TTS – تولید خودکار از وضعیت فعلی کدها</p>
+  </div>
+</body>
+</html>
