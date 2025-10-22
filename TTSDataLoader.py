@@ -1,5 +1,5 @@
 # TTSDataLoader.py
-import os, math, random
+import os, math, random, hashlib
 import concurrent.futures
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Optional
@@ -410,6 +410,40 @@ def wav_to_logmel_np(path: str, cfg: AudioCfg) -> np.ndarray:
     logmel = (logmel + 100.0) / 100.0 * 2.0 - 1.0   # → [-1, 1]
     return logmel.T.astype(np.float32)              # (frames, n_mels)
 
+# ====== Simple on-disk cache for mel features ======
+def _mel_cache_key(wav_path: str, cfg: AudioCfg) -> str:
+    try:
+        st = os.stat(wav_path)
+        sig = f"{wav_path}|{st.st_size}|{st.st_mtime}|{cfg.target_sample_rate}|{cfg.n_fft}|{cfg.hop_length}|{cfg.win_length}|{cfg.n_mels}|{cfg.fmin}|{cfg.fmax}|{cfg.trim_silence}|{cfg.trim_threshold_db}"
+    except FileNotFoundError:
+        sig = f"{wav_path}|missing|{cfg}"
+    h = hashlib.sha1(sig.encode("utf-8")).hexdigest()
+    return h
+
+def _mel_cache_path(cache_dir: str, wav_path: str, cfg: AudioCfg) -> str:
+    key = _mel_cache_key(wav_path, cfg)
+    sub = os.path.join(cache_dir, "mels", key[:2], key[2:4])  # shard to avoid huge dirs
+    os.makedirs(sub, exist_ok=True)
+    return os.path.join(sub, f"{key}.npy")
+
+def _load_or_compute_mel_cached(wav_path: str, cfg: AudioCfg, cache_dir: Optional[str]):
+    if cache_dir:
+        path = _mel_cache_path(cache_dir, wav_path, cfg)
+        if os.path.exists(path):
+            try:
+                mel = np.load(path)
+                return mel, mel.shape[0], True
+            except Exception:
+                pass  # fallthrough to recompute
+    mel = wav_to_logmel_np(wav_path, cfg)
+    if cache_dir:
+        out_path = _mel_cache_path(cache_dir, wav_path, cfg)
+        try:
+            np.save(out_path, mel)
+        except Exception:
+            pass
+    return mel, mel.shape[0], False
+
 def tokenize_texts(items: List[Tuple[str, str]], tok: AutoTokenizer, text_cfg: TextCfg):
     ids_list = []
     for _, txt in items:
@@ -419,10 +453,12 @@ def tokenize_texts(items: List[Tuple[str, str]], tok: AutoTokenizer, text_cfg: T
     return ids_list
 
 def _mel_worker(args):
-    """Worker for parallel mel computation. args=(wav_path, audio_cfg)"""
-    wav_path, audio_cfg = args
-    mel = wav_to_logmel_np(wav_path, audio_cfg)
-    return mel, mel.shape[0]
+    """Worker for parallel mel computation with optional cache.
+    args=(wav_path, audio_cfg, cache_dir)
+    """
+    wav_path, audio_cfg, cache_dir = args
+    mel, T, _ = _load_or_compute_mel_cached(wav_path, audio_cfg, cache_dir)
+    return mel, T
 
 def preprocess_dataset(
     root_dir: str,
@@ -431,6 +467,7 @@ def preprocess_dataset(
     tok,
     metadata_name: str = "metadata.csv",
     num_workers: int = None,
+    cache_dir: Optional[str] = None,
 ):
     """
     Offline preprocessing (tokenize + wav→mel) with optional parallel mel computation.
@@ -449,22 +486,32 @@ def preprocess_dataset(
 
     wav_paths = [wav for (wav, _) in items]
 
+    cache_hits = 0
     if num_workers <= 1 or len(wav_paths) <= 1:
         mels = []
         mel_lens = []
         for wav in wav_paths:
-            mel = wav_to_logmel_np(wav, audio_cfg)
+            mel, T, hit = _load_or_compute_mel_cached(wav, audio_cfg, cache_dir)
+            cache_hits += int(bool(hit))
             mels.append(mel)
-            mel_lens.append(mel.shape[0])
+            mel_lens.append(T)
     else:
         # Parallel computation using process pool
-        args_iter = [(wav, audio_cfg) for wav in wav_paths]
+        args_iter = [(wav, audio_cfg, cache_dir) for wav in wav_paths]
         mels = []
         mel_lens = []
+        # choose a reasonable chunksize to reduce IPC overhead
+        chunksize = max(1, len(wav_paths) // (num_workers * 8) if num_workers else 1)
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as ex:
-            for mel, T in ex.map(_mel_worker, args_iter, chunksize=1):
+            for mel, T in ex.map(_mel_worker, args_iter, chunksize=chunksize):
                 mels.append(mel)
                 mel_lens.append(T)
+
+    if cache_dir:
+        try:
+            print(f"[preprocess] mel cache: hits={cache_hits}/{len(wav_paths)} dir={os.path.abspath(cache_dir)}")
+        except Exception:
+            pass
 
     return items, text_ids, mels, np.asarray(mel_lens, dtype=np.int32)
 

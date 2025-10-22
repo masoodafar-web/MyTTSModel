@@ -52,11 +52,14 @@ class MelPositionalProjection(layers.Layer):
         self.pos_encoding = positional_encoding(max_length, d_model)
 
     def call(self, mel):
+        # Feed float32 to prenet; it will cast internally if using mixed precision
         x = tf.cast(mel, tf.float32)
-        x = self.prenet(x)                                     # (B,T,D)
-        x *= tf.math.sqrt(tf.cast(tf.shape(x)[-1], tf.float32))
+        x = self.prenet(x)                                     # (B,T,D), may be float16 under mixed precision
+        scale = tf.math.sqrt(tf.cast(tf.shape(x)[-1], x.dtype))
+        x = x * scale
         length = tf.shape(x)[1]
-        x = x + self.pos_encoding[tf.newaxis, :length, :]
+        pos = tf.cast(self.pos_encoding[tf.newaxis, :length, :], x.dtype)
+        x = x + pos
         return x
 
 # =========================
@@ -114,7 +117,7 @@ class BaseAttentionPreNorm(layers.Layer):
         self.drop_path = DropPath(droppath, name="droppath") if droppath > 0 else None
         self.add = layers.Add(name="add")
 
-    def call(self, x, *, context=None, attn_mask=None, q_valid=None, training=False):
+    def call(self, x, *, context=None, attn_mask=None, q_valid=None, training=False, need_attn=False):
         xn = self.norm(x)
         # Normalize attention_mask semantics across TF versions:
         # Convert boolean "allowed" masks to additive bias: 0 for allowed, -1e9 for blocked.
@@ -129,15 +132,28 @@ class BaseAttentionPreNorm(layers.Layer):
                 attn_bias = tf.cast(attn_mask, tf.float32)
 
         if context is None:
-            h = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_bias, training=training)
+            if need_attn:
+                h, scores = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_bias,
+                                     training=training, return_attention_scores=True)
+            else:
+                h = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_bias, training=training)
+                scores = None
         else:
-            h = self.mha(query=xn, key=context, value=context, attention_mask=attn_bias, training=training)
+            if need_attn:
+                h, scores = self.mha(query=xn, key=context, value=context, attention_mask=attn_bias,
+                                     training=training, return_attention_scores=True)
+            else:
+                h = self.mha(query=xn, key=context, value=context, attention_mask=attn_bias, training=training)
+                scores = None
         if q_valid is not None:
             h *= tf.cast(q_valid[..., None], h.dtype)
         h = self.res_dropout(h, training=training)
         if self.drop_path is not None:
             h = self.drop_path(h, training=training)
-        return self.add([x, h])
+        out = self.add([x, h])
+        if need_attn:
+            return out, scores
+        return out
 
 class FeedForwardPreNorm(layers.Layer):
     def __init__(self, d_model, dff, dropout=0.1, droppath=0.0, name=None):
@@ -187,10 +203,17 @@ class DecoderLayer(layers.Layer):
         )
         self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, name="ffn")
 
-    def call(self, x, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False):
+    def call(self, x, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False, need_attn=False):
         x = self.causal_self_attention(x, attn_mask=dec_causal_key_mask, q_valid=q_valid, training=training)
-        x = self.cross_attention(x, context=context, attn_mask=enc_key_mask, q_valid=q_valid, training=training)
+        if need_attn:
+            x, scores = self.cross_attention(x, context=context, attn_mask=enc_key_mask, q_valid=q_valid,
+                                             training=training, need_attn=True)
+        else:
+            x = self.cross_attention(x, context=context, attn_mask=enc_key_mask, q_valid=q_valid, training=training)
+            scores = None
         x = self.ffn(x, training=training)
+        if need_attn:
+            return x, scores
         return x
 
 # =========================
@@ -233,13 +256,23 @@ class DecoderTTS(tf.keras.Model):
                              dropout_rate=dropout_rate, droppath=dp, name=f"block_{i}")
             )
 
-    def call(self, mel_in, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False):
+    def call(self, mel_in, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False, return_attn=False):
         x = self.mel_proj(mel_in)
         x = self.dropout(x, training=training)
-        for lyr in self.layers_:
-            x = lyr(x, context, dec_causal_key_mask=dec_causal_key_mask,
-                    enc_key_mask=enc_key_mask, q_valid=q_valid, training=training)
-        return x  # (B,T,D)
+        last_scores = None
+        for i, lyr in enumerate(self.layers_):
+            need_attn = bool(return_attn) and (i == len(self.layers_) - 1)
+            if need_attn:
+                x, last_scores = lyr(x, context, dec_causal_key_mask=dec_causal_key_mask,
+                                     enc_key_mask=enc_key_mask, q_valid=q_valid, training=training, need_attn=True)
+            else:
+                x = lyr(x, context, dec_causal_key_mask=dec_causal_key_mask,
+                        enc_key_mask=enc_key_mask, q_valid=q_valid, training=training)
+        if return_attn:
+            # Keras MHA scores shape: (B, num_heads, T_dec, S_enc). Reduce heads → (B, T_dec, S_enc)
+            if last_scores is not None:
+                last_scores = tf.reduce_mean(tf.cast(last_scores, tf.float32), axis=1)
+        return (x, last_scores) if return_attn else x  # (B,T,D) and optional (B,T,S)
 
 # =========================
 # PostNet
@@ -326,7 +359,7 @@ class TransformerTTS(tf.keras.Model):
         dec_causal_key = combine_causal_and_keypadding(dec_valid)     # (B,T,T)
         return enc_valid, enc_key_mask, dec_valid, dec_causal_key
 
-    def call(self, inputs, training=False):
+    def call(self, inputs, training=False, return_attn=False):
         if isinstance(inputs, (list, tuple)):
             enc_ids, dec_mel = inputs
             enc_len = None
@@ -343,18 +376,26 @@ class TransformerTTS(tf.keras.Model):
 
         enc_out = self.encoder(enc_ids, key_mask=enc_key_mask, q_valid=enc_valid, training=training)
 
-        dec_out = self.decoder(dec_mel, enc_out,
+        dec_res = self.decoder(dec_mel, enc_out,
                                dec_causal_key_mask=dec_causal_key,
                                enc_key_mask=enc_key_mask,
                                q_valid=dec_valid,
-                               training=training)
+                               training=training,
+                               return_attn=return_attn)
+        if return_attn:
+            dec_out, attn_last = dec_res
+        else:
+            dec_out = dec_res
+            attn_last = None
 
         mel_pred_pre = tf.cast(self.mel_head(dec_out), tf.float32)
         stop_logits  = tf.cast(self.stop_head(dec_out), tf.float32)
 
-        mel_residual = self.postnet(mel_pred_pre, training=training)
+        mel_residual = tf.cast(self.postnet(mel_pred_pre, training=training), tf.float32)
         mel_pred_post = mel_pred_pre + mel_residual
 
+        if return_attn:
+            return mel_pred_pre, mel_pred_post, stop_logits, attn_last
         return mel_pred_pre, mel_pred_post, stop_logits
 
     def build_for_load(self, max_src_len, max_tgt_len, dtype_ids=tf.int32, dtype_mel=tf.float32):

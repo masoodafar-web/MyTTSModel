@@ -1,22 +1,39 @@
 # MyTTSModelTrain.py
-import os, datetime, logging, warnings, tensorflow as tf
+import os, datetime, logging, warnings, tensorflow as tf, numpy as np
 from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
 from TTSDataLoader import (AudioCfg, TextCfg, preprocess_dataset, TTSDataset)
 
 # GPU & logs
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 gpus = tf.config.list_physical_devices("GPU")
 for g in gpus:
-    try: tf.config.experimental.set_memory_growth(g, True)
-    except: pass
+    try:
+        tf.config.experimental.set_memory_growth(g, True)
+    except Exception:
+        pass
 import absl.logging
 tf.get_logger().setLevel(logging.ERROR)
 absl.logging.set_verbosity(absl.logging.ERROR)
 warnings.filterwarnings("ignore")
 # Quiet transformers deprecation/info logs
 hf_logging.set_verbosity_error()
+
+# ---- Mixed precision (speeds up on modern GPUs) ----
+try:
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy("mixed_float16")
+    print("Using mixed precision: float16 compute, float32 vars")
+except Exception as _e:
+    print("Mixed precision not enabled:", _e)
+
+# ---- Multi-GPU strategy (MirroredStrategy) ----
+try:
+    strategy = tf.distribute.MirroredStrategy()
+    print(f"Using {strategy.num_replicas_in_sync} GPUs (MirroredStrategy)")
+except Exception as e:
+    print("MirroredStrategy unavailable, falling back to default. Reason:", e)
+    strategy = tf.distribute.get_strategy()
 
 # ---- Dataset configs
 ROOT = "../dataset/dataset_train"
@@ -42,15 +59,30 @@ text_cfg  = TextCfg(
 
 
 print("Preprocessing (tokenize + wav→mel) ...")
+# فعال‌سازی کشِ مِل + پردازش موازی برای سرعت بهتر
+cache_dir = os.path.join("checkpoints", "mel_cache")
+os.makedirs(cache_dir, exist_ok=True)
+num_workers = max(1, (os.cpu_count() or 2) - 1)
 items, text_ids, mels, mel_lens = preprocess_dataset(
-    ROOT, audio_cfg, text_cfg, tok, metadata_name="metadata_train.csv"
+    ROOT, audio_cfg, text_cfg, tok,
+    metadata_name="metadata_train.csv",
+    num_workers=num_workers,
+    cache_dir=cache_dir,
 )
 print("Examples:", len(items), " | First mel:", mels[0].shape, "| First text len:", len(text_ids[0]))
+try:
+    max_tok_id = int(max((max(t) if len(t)>0 else 0) for t in text_ids)) if len(text_ids)>0 else 0
+except Exception:
+    max_tok_id = 0
+print(f"Tokenizer size: vocab={tok.vocab_size} | len(tokenizer)={len(tok)} | max_id_in_data={max_tok_id}")
 
 # ---- Split train/val (بدون نشت)
 BATCH_SIZE   = 4
-MAX_SRC_LEN  = 256
-MAX_MEL_LEN  = 2000
+# طول‌ها را بر اساس صدک‌ها تعیین کن تا پَدینگ کمتر شود
+text_lens = np.asarray([len(t) for t in text_ids], dtype=np.int32)
+mel_lens  = np.asarray(mel_lens, dtype=np.int32)
+MAX_SRC_LEN  = int(min(256, max(8, np.percentile(text_lens, 99) + 8)))
+MAX_MEL_LEN  = int(min(2000, max(64, np.percentile(mel_lens, 99) + 16)))
 N_MELS       = audio_cfg.n_mels
 
 N = len(items)
@@ -59,15 +91,27 @@ val_ratio = 0.02
 n_val = max(1, int(N * val_ratio))
 if (N - n_val) < BATCH_SIZE:
     n_val = max(1, N - BATCH_SIZE)
-n_val = max(1, min(n_val, max(1, N - 1)))
+perm = np.random.RandomState(42).permutation(N)
+tr_idx, va_idx = perm[: N - n_val], perm[N - n_val :]
 
-train_slice = slice(0, N - n_val)
-val_slice   = slice(N - n_val, N)
+items_tr = [items[i] for i in tr_idx]
+items_va = [items[i] for i in va_idx]
+text_ids_tr = [text_ids[i] for i in tr_idx]
+text_ids_va = [text_ids[i] for i in va_idx]
+mels_tr = [mels[i] for i in tr_idx]
+mels_va = [mels[i] for i in va_idx]
+mel_lens_tr = mel_lens[tr_idx]
+mel_lens_va = mel_lens[va_idx]
 
-items_tr, items_va         = items[train_slice],   items[val_slice]
-text_ids_tr, text_ids_va   = text_ids[train_slice], text_ids[val_slice]
-mels_tr, mels_va           = mels[train_slice],    mels[val_slice]
-mel_lens_tr, mel_lens_va   = mel_lens[train_slice], mel_lens[val_slice]
+# اطمینان از سازگاری اندازه‌ی بچ با تعداد GPUها (global batch size)
+try:
+    num_repl = strategy.num_replicas_in_sync
+    if BATCH_SIZE % max(1, num_repl) != 0:
+        new_bs = num_repl * ((BATCH_SIZE + num_repl - 1) // num_repl)
+        print(f"Adjusting BATCH_SIZE {BATCH_SIZE} -> {new_bs} for {num_repl} replicas")
+        BATCH_SIZE = new_bs
+except Exception:
+    pass
 
 train_gen = TTSDataset(
     text_ids_list=text_ids_tr,
@@ -93,29 +137,47 @@ val_gen = TTSDataset(
 # ---- Model
 from MyTTSModel import TransformerTTS
 
-model_core = TransformerTTS(
-    num_layers=6, d_model=256, num_heads=8, dff=1024,
-    input_vocab_size=tok.vocab_size,
-    n_mels=N_MELS, dropout_rate=0.1, pad_id=text_cfg.pad_id,
-    use_prenet=True, prenet_drop=0.5
-)
-core_path="checkpoints/tts_core_last.weights.h5"
-model_core.build_for_load(max_src_len=MAX_SRC_LEN, max_tgt_len=MAX_MEL_LEN)
-if os.path.exists(core_path):
-    model_core.load_weights(core_path)
-    print("✅ Weights loaded.")
-else:
-    print("⚠️ Checkpoint not found:", core_path)
+core_path = "checkpoints/tts_core_last.weights.h5"
+# مدل را با اندازه واژگان len(tokenizer) می‌سازیم تا added tokens را پوشش دهد
+D_MODEL = 256
+NUM_LAYERS = 6
+NUM_HEADS = 8
+DFF = 1024
+with strategy.scope():
+    model_core = TransformerTTS(
+        num_layers=NUM_LAYERS, d_model=D_MODEL, num_heads=NUM_HEADS, dff=DFF,
+        input_vocab_size=len(tok),
+        n_mels=N_MELS, dropout_rate=0.1, pad_id=text_cfg.pad_id,
+        use_prenet=True, prenet_drop=0.5
+    )
+    model_core.build_for_load(max_src_len=MAX_SRC_LEN, max_tgt_len=MAX_MEL_LEN)
+    if os.path.exists(core_path):
+        try:
+            model_core.load_weights(core_path)
+            print("✅ Weights loaded.")
+        except Exception as e:
+            print("⚠️ Failed to load weights strictly:", e)
+            try:
+                model_core.load_weights(core_path, by_name=True, skip_mismatch=True)
+                print("✅ Weights loaded by_name with skip_mismatch.")
+            except Exception as e2:
+                print("⚠️ Skipped loading weights due to shape mismatch:", e2)
+    else:
+        print("⚠️ Checkpoint not found:", core_path)
 
 # ---- Learner (custom train/test step + ماسک)
 AUTO_SHIFT = False  # اگر دیتالودر dec_mel شیفت‌شده می‌دهد، False بماند
 
 class TTSLearner(tf.keras.Model):
-    def __init__(self, core, loss_weights=None, stop_pos_weight=5.0):
+    def __init__(self, core, loss_weights=None, stop_pos_weight=None, ga_weight=0.2, ga_sigma=0.2):
         super().__init__()
         self.core = core
         self.loss_weights = loss_weights or {"mel_pre": 0.5, "mel_post": 1.0, "stop": 0.5}
-        self.stop_pos_weight = float(stop_pos_weight)
+        # None یا <=0 یعنی محاسبه پویا از نسبت کلاس‌ها در هر بچ
+        self.stop_pos_weight = None if (stop_pos_weight is None) else float(stop_pos_weight)
+        # Guided Attention
+        self.ga_weight = float(ga_weight)
+        self.ga_sigma = float(ga_sigma)
 
         # Metrics
         self.train_loss = tf.keras.metrics.Mean(name="loss")
@@ -125,6 +187,7 @@ class TTSLearner(tf.keras.Model):
         self.bce_stop   = tf.keras.metrics.Mean(name="bce_stop")
         self.stop_acc   = tf.keras.metrics.BinaryAccuracy(threshold=0.5, name="stop_acc")
         self.within2db  = tf.keras.metrics.Mean(name="within2db")
+        self.ga_metric  = tf.keras.metrics.Mean(name="gal")
 
     # ---------- helpers ----------
     @staticmethod
@@ -176,9 +239,17 @@ class TTSLearner(tf.keras.Model):
             logits = tf.squeeze(logits, -1)                       # (B,T)
         stop_mask = tf.cast(stop_mask, tf.float32)                # (B,T)
 
+        # محاسبهٔ پویا: pos_weight = neg/pos روی فریم‌های ماسک‌شده
+        if (self.stop_pos_weight is None) or (self.stop_pos_weight <= 0.0):
+            pos = tf.reduce_sum(y_true * stop_mask) + 1e-8
+            neg = tf.reduce_sum((1.0 - y_true) * stop_mask) + 1e-8
+            pos_weight_val = neg / pos
+        else:
+            pos_weight_val = tf.constant(self.stop_pos_weight, dtype=tf.float32)
+
         loss_el = tf.nn.weighted_cross_entropy_with_logits(
-            labels=y_true, logits=logits, pos_weight=self.stop_pos_weight
-        )                                                         # (B,T)
+            labels=y_true, logits=logits, pos_weight=pos_weight_val
+        )  # (B,T)
         num = tf.reduce_sum(loss_el * stop_mask)
         den = tf.reduce_sum(stop_mask) + 1e-8
         return num / den
@@ -209,13 +280,56 @@ class TTSLearner(tf.keras.Model):
             message="[assert] Decoder input must be right-shifted targets."
         )
 
+    # ---------- Guided Attention Loss ----------
+    def _guided_attn_loss(self, attn, enc_ids, mel_len, sigma=0.2):
+        # attn: (B, T_dec, S_enc) softmax weights
+        # enc_ids: (B, S_enc) to infer enc_len via pad_id
+        # mel_len: (B,) int32
+        if attn is None:
+            return tf.constant(0.0, tf.float32)
+        attn = tf.cast(attn, tf.float32)
+
+        B = tf.shape(attn)[0]
+        T = tf.shape(attn)[1]
+        S = tf.shape(attn)[2]
+
+        # lengths
+        enc_valid = tf.not_equal(tf.cast(enc_ids, tf.int32), tf.cast(self.core.pad_id, tf.int32))  # (B,S)
+        enc_len = tf.reduce_sum(tf.cast(enc_valid, tf.int32), axis=1)  # (B,)
+        dec_len = tf.cast(mel_len, tf.int32)
+
+        # normalized coordinates
+        t_idx = tf.cast(tf.range(T)[None, :, None], tf.float32)  # (1,T,1)
+        s_idx = tf.cast(tf.range(S)[None, None, :], tf.float32)  # (1,1,S)
+        t_norm = t_idx / tf.maximum(tf.cast(dec_len[:, None, None], tf.float32) - 1.0, 1.0)  # (B,T,1)
+        s_norm = s_idx / tf.maximum(tf.cast(enc_len[:, None, None], tf.float32) - 1.0, 1.0)  # (B,1,S)
+        # penalty mask: 1 - exp(-(t-s)^2 / (2*sigma^2))
+        diff = t_norm - s_norm  # (B,T,S)
+        g2 = 2.0 * (sigma ** 2)
+        W = 1.0 - tf.exp(- (diff * diff) / g2)
+
+        # mask out padding positions
+        dec_mask = tf.sequence_mask(dec_len, maxlen=T, dtype=tf.float32)[:, :, None]  # (B,T,1)
+        enc_mask = tf.sequence_mask(enc_len, maxlen=S, dtype=tf.float32)[:, None, :]  # (B,1,S)
+        mask = dec_mask * enc_mask  # (B,T,S)
+
+        num = tf.reduce_sum(W * attn * mask)
+        den = tf.reduce_sum(mask) + 1e-8
+        return num / den
+
     def call(self, inputs, training=False):
         x = inputs
         if training and AUTO_SHIFT:
             x = dict(inputs)
             x["dec_mel"] = self.core.shift_right_mel(inputs["dec_mel"], pad_val=0.0)
-        mel_pre, mel_post, stop_logits = self.core(x, training=training)
-        return {"mel_pre": mel_pre, "mel_post": mel_post, "stop": stop_logits}
+        # درخواست attn در train/val برای GAL
+        if training:
+            outs = self.core(x, training=training, return_attn=True)
+            mel_pre, mel_post, stop_logits, attn = outs
+            return {"mel_pre": mel_pre, "mel_post": mel_post, "stop": stop_logits, "attn": attn}
+        else:
+            mel_pre, mel_post, stop_logits = self.core(x, training=training)
+            return {"mel_pre": mel_pre, "mel_post": mel_post, "stop": stop_logits, "attn": None}
 
     # ---------- train/test ----------
     def train_step(self, data):
@@ -238,10 +352,12 @@ class TTSLearner(tf.keras.Model):
             l1_post = self._masked_mae(targets["mel_post"], outputs["mel_post"], frame_mask)
             bce_stop= self._weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
 
+            ga = self._guided_attn_loss(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
             loss = (
                 self.loss_weights["mel_pre"]  * l1_pre +
                 self.loss_weights["mel_post"] * l1_post +
-                self.loss_weights["stop"]     * bce_stop
+                self.loss_weights["stop"]     * bce_stop +
+                self.ga_weight * ga
             )
 
         grads = tape.gradient(loss, self.trainable_variables)
@@ -252,6 +368,7 @@ class TTSLearner(tf.keras.Model):
         self.mae_pre.update_state(l1_pre)
         self.mae_post.update_state(l1_post)
         self.bce_stop.update_state(bce_stop)
+        self.ga_metric.update_state(ga)
 
         # BinaryAccuracy با ماسک stop
         stop_prob   = tf.sigmoid(outputs["stop"])                                 # (B,T,1)
@@ -269,6 +386,7 @@ class TTSLearner(tf.keras.Model):
             "bce_stop": self.bce_stop.result(),
             "stop_acc": self.stop_acc.result(),
             "within2db": self.within2db.result(),
+            "gal": self.ga_metric.result(),
         }
 
     def test_step(self, data):
@@ -277,7 +395,9 @@ class TTSLearner(tf.keras.Model):
         else:
             inputs, targets = data
 
-        outputs = self(inputs, training=False)
+        # Run core in eval mode but request attention for GA monitoring
+        mel_pre_core, mel_post_core, stop_logits_core, attn_core = self.core(inputs, training=False, return_attn=True)
+        outputs = {"mel_pre": mel_pre_core, "mel_post": mel_post_core, "stop": stop_logits_core, "attn": attn_core}
 
         frame_mask = self._frame_mask_from_targets(targets)   # (B,T,1)
         stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
@@ -286,10 +406,12 @@ class TTSLearner(tf.keras.Model):
         l1_post = self._masked_mae(targets["mel_post"], outputs["mel_post"], frame_mask)
         bce_stop= self._weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
 
+        ga = self._guided_attn_loss(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
         loss = (
             self.loss_weights["mel_pre"]  * l1_pre +
             self.loss_weights["mel_post"] * l1_post +
-            self.loss_weights["stop"]     * bce_stop
+            self.loss_weights["stop"]     * bce_stop +
+            self.ga_weight * ga
         )
 
         self.val_loss.update_state(loss)
@@ -312,6 +434,7 @@ class TTSLearner(tf.keras.Model):
             "bce_stop": bce_stop,
             "stop_acc": val_stop_acc,
             "within2db": val_within2db,
+            "gal": ga,
         }
 
 # ---- Optimizer / LR schedule
@@ -324,15 +447,62 @@ class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
         return tf.math.rsqrt(self.d_model) * tf.math.minimum(tf.math.rsqrt(step), step * (warm ** -1.5))
 
 steps_per_epoch = max(1, len(train_gen))
-optimizer = tf.keras.optimizers.Adam(
-    CustomSchedule(256, warmup_steps=max(1, 8*steps_per_epoch)),
-    beta_1=0.9, beta_2=0.98, epsilon=1e-9, clipnorm=1.0
-)
+with strategy.scope():
+    optimizer = tf.keras.optimizers.Adam(
+        CustomSchedule(D_MODEL, warmup_steps=max(1, 8*steps_per_epoch)),
+        beta_1=0.9, beta_2=0.98, epsilon=1e-9, clipnorm=1.0
+    )
 
-learner = TTSLearner(model_core, loss_weights={"mel_pre":0.5, "mel_post":1.0, "stop":0.5}, stop_pos_weight=5.0)
-learner.compile(optimizer=optimizer, run_eagerly=False)
+    learner = TTSLearner(
+        model_core,
+        loss_weights={"mel_pre": 0.5, "mel_post": 1.0, "stop": 0.5},
+        stop_pos_weight=None,
+        ga_weight=0.2,
+        ga_sigma=0.2,
+    )
+    learner.compile(optimizer=optimizer, run_eagerly=False)
 
 # ---- Callbacks
+class EMAAndSaveCore(tf.keras.callbacks.Callback):
+    def __init__(self, decay=0.999, core_path="checkpoints/tts_core_last.weights.h5"):
+        super().__init__()
+        self.decay = float(decay)
+        self._pairs = None
+        self.core_path = core_path
+        self.ema_path = "checkpoints/tts_core_ema_last.weights.h5"
+
+    def on_train_begin(self, logs=None):
+        core = self.model.core
+        pairs = []
+        for v in core.trainable_variables:
+            ema_v = tf.Variable(tf.zeros_like(v), trainable=False)
+            ema_v.assign(v)
+            pairs.append((ema_v, v))
+        self._pairs = pairs
+
+    def on_train_batch_end(self, batch, logs=None):
+        if not self._pairs:
+            return
+        d = self.decay
+        for ema_v, v in self._pairs:
+            ema_v.assign(d * ema_v + (1.0 - d) * tf.cast(v, ema_v.dtype))
+
+    def on_epoch_end(self, epoch, logs=None):
+        core = self.model.core
+        # Save regular core
+        core.save_weights(self.core_path)
+        msg = "\n[saved core → checkpoints/tts_core_last.weights.h5]"
+        # Save EMA snapshot by swapping weights temporarily
+        if self._pairs:
+            orig_vals = [tf.identity(v) for _, v in self._pairs]
+            for ema_v, v in self._pairs:
+                v.assign(tf.cast(ema_v, v.dtype))
+            core.save_weights(self.ema_path)
+            for (ema_v, v), val in zip(self._pairs, orig_vals):
+                v.assign(val)
+            msg += " | [ema saved → checkpoints/tts_core_ema_last.weights.h5]"
+        print(msg)
+
 tb   = tf.keras.callbacks.TensorBoard(
     log_dir=f"logs/tts/{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}",
     update_freq='batch'
@@ -345,12 +515,7 @@ ckpt_learner = tf.keras.callbacks.ModelCheckpoint(
     monitor="val_loss", mode="min", verbose=1
 )
 
-class SaveCore(tf.keras.callbacks.Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        self.model.core.save_weights(core_path)
-        print("\n[saved core → checkpoints/tts_core_last.weights.h5]")
-
-callbacks = [ckpt_learner, SaveCore(), tb, early]
+callbacks = [EMAAndSaveCore(decay=0.999, core_path=core_path), ckpt_learner, tb, early]
 
 print("Fitting ...")
 val_data = val_gen if len(val_gen) > 0 else None
