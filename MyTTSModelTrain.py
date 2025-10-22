@@ -1,4 +1,24 @@
 # MyTTSModelTrain.py
+"""
+Training script for MyTTSModel - Transformer-based Text-to-Speech
+
+This module provides:
+- Data preprocessing and loading for TTS training
+- Custom training loop with masked losses
+- Guided Attention Loss (GAL) with ramp-up
+- Multiple metrics: L1 loss per mel-band, stop accuracy, within-epsilon-dB
+- EMA (Exponential Moving Average) of weights
+- Learning rate scheduling (Noam schedule)
+- Multi-GPU support via MirroredStrategy
+- Mixed precision training
+
+The training uses:
+- NLLB tokenizer for multilingual text encoding
+- Mel-spectrogram preprocessing with caching
+- Teacher forcing with right-shifted decoder input
+- Dynamic stop token weighting based on class imbalance
+"""
+
 import os, datetime, logging, warnings, tensorflow as tf, numpy as np
 from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
@@ -169,6 +189,34 @@ with strategy.scope():
 AUTO_SHIFT = False  # اگر دیتالودر dec_mel شیفت‌شده می‌دهد، False بماند
 
 class TTSLearner(tf.keras.Model):
+    """
+    Custom training wrapper for TransformerTTS with masked losses and metrics.
+    
+    Implements custom train_step and test_step with:
+    - Masked L1 loss for mel-spectrogram (mean per band)
+    - Weighted binary cross-entropy for stop tokens with dynamic class weighting
+    - Guided Attention Loss (GAL) with configurable weight and sigma
+    - Multiple training metrics including within-epsilon-dB accuracy
+    
+    Args:
+        core (TransformerTTS): The core TTS model.
+        loss_weights (dict, optional): Weights for different loss components.
+            Default: {"mel_pre": 0.5, "mel_post": 1.0, "stop": 0.5}.
+        stop_pos_weight (float, optional): Positive class weight for stop BCE.
+            If None or <=0, computed dynamically from batch statistics.
+        ga_weight (float): Initial weight for Guided Attention Loss. Default: 0.2.
+        ga_sigma (float): Sigma parameter for GAL diagonal penalty. Default: 0.2.
+        
+    Attributes:
+        core (TransformerTTS): The wrapped TTS model.
+        ga_weight_var (tf.Variable): Current GAL weight (can be ramped during training).
+        train_loss, val_loss (tf.keras.metrics.Mean): Training and validation loss trackers.
+        mae_pre, mae_post (tf.keras.metrics.Mean): L1 loss trackers for pre/post mel.
+        bce_stop (tf.keras.metrics.Mean): BCE loss tracker for stop tokens.
+        stop_acc (tf.keras.metrics.BinaryAccuracy): Stop token prediction accuracy.
+        within2db (tf.keras.metrics.Mean): Percentage of mel bins within 2dB error.
+        ga_metric (tf.keras.metrics.Mean): Guided attention penalty tracker.
+    """
     def __init__(self, core, loss_weights=None, stop_pos_weight=None, ga_weight=0.2, ga_sigma=0.2):
         super().__init__()
         self.core = core
@@ -225,6 +273,17 @@ class TTSLearner(tf.keras.Model):
 
     @staticmethod
     def _masked_mae(y_true, y_pred, mask):
+        """
+        Compute masked mean absolute error.
+        
+        Args:
+            y_true (tf.Tensor): Ground truth values.
+            y_pred (tf.Tensor): Predicted values.
+            mask (tf.Tensor): Binary mask indicating valid positions.
+            
+        Returns:
+            tf.Tensor: Scalar MAE loss over valid positions.
+        """
         mask = tf.cast(mask, y_pred.dtype)                        # (B,T,1) یا (B,T,80)
         diff = tf.abs(y_pred - y_true)
         num  = tf.reduce_sum(diff * mask)
@@ -243,6 +302,20 @@ class TTSLearner(tf.keras.Model):
         return num / den
 
     def _weighted_bce_logits(self, y_true, logits, stop_mask):
+        """
+        Compute weighted binary cross-entropy with dynamic positive class weighting.
+        
+        Automatically balances positive/negative classes by computing pos_weight
+        as the ratio of negative to positive samples in the batch.
+        
+        Args:
+            y_true (tf.Tensor): Ground truth stop labels of shape (B, T, 1) or (B, T).
+            logits (tf.Tensor): Predicted stop logits of shape (B, T, 1) or (B, T).
+            stop_mask (tf.Tensor): Binary mask of shape (B, T) indicating valid frames.
+            
+        Returns:
+            tf.Tensor: Scalar masked BCE loss.
+        """
         # y_true: (B,T,1) | logits: (B,T,1) | stop_mask: (B,T)
         y_true = tf.cast(y_true, tf.float32)
         if len(y_true.shape) == 3 and y_true.shape[-1] == 1:
@@ -286,6 +359,19 @@ class TTSLearner(tf.keras.Model):
         return num / den
 
     def _assert_shift_ok(self, inputs, targets):
+        """
+        Sanity check that decoder input is properly right-shifted from targets.
+        
+        Verifies that dec_mel[:, 1:3] ≈ mel_target[:, 0:2] to ensure correct
+        teacher forcing setup.
+        
+        Args:
+            inputs (dict): Input dictionary containing 'dec_mel'.
+            targets (dict): Target dictionary containing 'mel_pre' or 'mel_post'.
+            
+        Raises:
+            tf.errors.InvalidArgumentError: If assertion fails.
+        """
         # چک سبک: dec_mel باید شیفت y باشد (dec[:,1] ≈ y[:,0])
         y_any = None
         if isinstance(targets, dict):
@@ -350,6 +436,16 @@ class TTSLearner(tf.keras.Model):
         return ga_loss, ga_metric
 
     def call(self, inputs, training=False):
+        """
+        Forward pass through the model.
+        
+        Args:
+            inputs (dict): Input dictionary with 'enc_ids', 'dec_mel', etc.
+            training (bool): Whether in training mode.
+            
+        Returns:
+            dict: Output dictionary with 'mel_pre', 'mel_post', 'stop', and 'attn' keys.
+        """
         x = inputs
         if training and AUTO_SHIFT:
             x = dict(inputs)
@@ -365,6 +461,21 @@ class TTSLearner(tf.keras.Model):
 
     # ---------- train/test ----------
     def train_step(self, data):
+        """
+        Custom training step with masked losses and guided attention.
+        
+        Computes:
+        - Masked L1 loss for mel_pre and mel_post (mean per mel-band)
+        - Weighted BCE for stop tokens with dynamic class balancing
+        - Guided Attention Loss with configurable weight
+        - Multiple metrics: stop accuracy, within-2dB accuracy, GAL penalty
+        
+        Args:
+            data (tuple): (inputs, targets) or (inputs, targets, sample_weights).
+            
+        Returns:
+            dict: Dictionary of metric names and values.
+        """
         if len(data) == 3:
             inputs, targets, _ = data
         else:
@@ -425,6 +536,18 @@ class TTSLearner(tf.keras.Model):
         }
 
     def test_step(self, data):
+        """
+        Custom validation/test step with masked losses and metrics.
+        
+        Similar to train_step but runs model in eval mode and computes metrics
+        for monitoring validation performance.
+        
+        Args:
+            data (tuple): (inputs, targets) or (inputs, targets, sample_weights).
+            
+        Returns:
+            dict: Dictionary of validation metric names and values.
+        """
         if len(data) == 3:
             inputs, targets, _ = data
         else:
@@ -474,9 +597,30 @@ class TTSLearner(tf.keras.Model):
 
 # ---- Optimizer / LR schedule
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """
+    Noam learning rate schedule as used in "Attention is All You Need".
+    
+    Implements warm-up followed by inverse square root decay:
+    lr = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
+    
+    Args:
+        d_model (int): Model dimension, used for scaling the learning rate.
+        warmup_steps (int): Number of warmup steps. Default: 4000.
+    """
+    
     def __init__(self, d_model, warmup_steps=4000):
         super().__init__(); self.d_model = tf.cast(d_model, tf.float32); self.warmup = float(max(1, warmup_steps))
+        
     def __call__(self, step):
+        """
+        Compute learning rate for given training step.
+        
+        Args:
+            step (int or tf.Tensor): Current training step.
+            
+        Returns:
+            tf.Tensor: Learning rate for this step.
+        """
         step = tf.cast(step, tf.float32)
         warm = tf.maximum(tf.constant(self.warmup, tf.float32), tf.constant(1.0, tf.float32))
         return tf.math.rsqrt(self.d_model) * tf.math.minimum(tf.math.rsqrt(step), step * (warm ** -1.5))
@@ -499,6 +643,22 @@ with strategy.scope():
 
 # ---- Callbacks
 class EMAAndSaveCore(tf.keras.callbacks.Callback):
+    """
+    Callback to maintain Exponential Moving Average (EMA) of model weights.
+    
+    Tracks EMA of all trainable variables and saves both regular and EMA
+    checkpoints at the end of each epoch. EMA weights often provide better
+    generalization and smoother inference.
+    
+    Args:
+        decay (float): EMA decay rate. Default: 0.999.
+        core_path (str): Path to save regular model weights.
+            Default: "checkpoints/tts_core_last.weights.h5".
+            
+    Attributes:
+        ema_path (str): Path for EMA weights (derived from core_path).
+    """
+    
     def __init__(self, decay=0.999, core_path="checkpoints/tts_core_last.weights.h5"):
         super().__init__()
         self.decay = float(decay)
@@ -507,6 +667,12 @@ class EMAAndSaveCore(tf.keras.callbacks.Callback):
         self.ema_path = "checkpoints/tts_core_ema_last.weights.h5"
 
     def on_train_begin(self, logs=None):
+        """
+        Initialize EMA shadow variables at the start of training.
+        
+        Args:
+            logs (dict, optional): Training logs.
+        """
         core = self.model.core
         pairs = []
         for v in core.trainable_variables:
@@ -551,6 +717,19 @@ ckpt_learner = tf.keras.callbacks.ModelCheckpoint(
 )
 
 class GAWeightRamp(tf.keras.callbacks.Callback):
+    """
+    Callback to gradually ramp up Guided Attention Loss weight during training.
+    
+    Linearly increases GAL weight from start value to target value over a
+    specified number of epochs. This helps stabilize early training before
+    enforcing strong attention alignment.
+    
+    Args:
+        start (float): Initial GAL weight. Default: 0.0.
+        target (float): Final GAL weight. Default: 0.2.
+        ramp_epochs (int): Number of epochs to ramp up. Default: 3.
+    """
+    
     def __init__(self, start=0.0, target=0.2, ramp_epochs=3):
         super().__init__()
         self.start = float(start)
@@ -558,6 +737,12 @@ class GAWeightRamp(tf.keras.callbacks.Callback):
         self.ramp_epochs = int(ramp_epochs)
 
     def on_train_begin(self, logs=None):
+        """
+        Set initial GAL weight at the start of training.
+        
+        Args:
+            logs (dict, optional): Training logs.
+        """
         try:
             self.model.ga_weight_var.assign(tf.cast(self.start, tf.float32))
         except Exception:
