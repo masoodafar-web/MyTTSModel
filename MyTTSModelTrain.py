@@ -1,6 +1,7 @@
 # MyTTSModelTrain.py
 import os, datetime, logging, warnings, tensorflow as tf
 from transformers import AutoTokenizer
+from transformers.utils import logging as hf_logging
 from TTSDataLoader import (AudioCfg, TextCfg, preprocess_dataset, TTSDataset)
 
 # GPU & logs
@@ -14,19 +15,29 @@ import absl.logging
 tf.get_logger().setLevel(logging.ERROR)
 absl.logging.set_verbosity(absl.logging.ERROR)
 warnings.filterwarnings("ignore")
+# Quiet transformers deprecation/info logs
+hf_logging.set_verbosity_error()
 
 # ---- Dataset configs
 ROOT = "../dataset/dataset_train"
 
-tok = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", use_fast=False)
-tok.src_lang = "src_lang"
+LANG_CODE = "eng_Latn"
+tok = AutoTokenizer.from_pretrained(
+    "facebook/nllb-200-distilled-600M", use_fast=False, src_lang=LANG_CODE
+)
 
 audio_cfg = AudioCfg(
     sample_rate=16000, target_sample_rate=16000,
     n_fft=1024, hop_length=256, win_length=1024,
     n_mels=80, fmin=0.0, fmax=8000.0, trim_silence=False
 )
-text_cfg  = TextCfg(pad_id=tok.pad_token_id, bos_id=tok.bos_token_id, eos_id=tok.eos_token_id, max_text_len=256, lang_code=tok.src_lang)
+text_cfg  = TextCfg(
+    pad_id=tok.pad_token_id,
+    bos_id=tok.bos_token_id,
+    eos_id=tok.eos_token_id,
+    max_text_len=256,
+    lang_code=LANG_CODE,
+)
 
 
 
@@ -44,7 +55,11 @@ N_MELS       = audio_cfg.n_mels
 
 N = len(items)
 val_ratio = 0.02
-n_val = max(max(1, int(N * val_ratio)), BATCH_SIZE)
+# حداقل 1 نمونه برای val، و اطمینان از یک batch برای train
+n_val = max(1, int(N * val_ratio))
+if (N - n_val) < BATCH_SIZE:
+    n_val = max(1, N - BATCH_SIZE)
+n_val = max(1, min(n_val, max(1, N - 1)))
 
 train_slice = slice(0, N - n_val)
 val_slice   = slice(N - n_val, N)
@@ -81,7 +96,7 @@ from MyTTSModel import TransformerTTS
 model_core = TransformerTTS(
     num_layers=6, d_model=256, num_heads=8, dff=1024,
     input_vocab_size=tok.vocab_size,
-    n_mels=N_MELS, dropout_rate=0.5, pad_id=text_cfg.pad_id,
+    n_mels=N_MELS, dropout_rate=0.1, pad_id=text_cfg.pad_id,
     use_prenet=True, prenet_drop=0.5
 )
 core_path="checkpoints/tts_core_last.weights.h5"
@@ -126,15 +141,22 @@ class TTSLearner(tf.keras.Model):
         mask_bt = tf.reduce_any(tf.math.abs(y) > 1e-6, axis=-1)   # (B,T) bool
         return tf.cast(mask_bt[..., None], tf.float32)            # (B,T,1)
 
-    @staticmethod
-    def _stop_mask_from_targets(targets):
-        """ماسک stop: هر جا لیبل stop موجود است، شمرده شود (معمولاً تمام فریم‌های معتبر + فریم پایان)"""
+    def _stop_mask(self, inputs, targets):
+        """ماسک stop مبتنی بر mel_len: فریم‌های [0..mel_len] در محاسبه لحاظ می‌شود.
+        یک فریم پس از پایان را نیز شامل می‌کنیم تا برچسب مثبت stop دیده شود."""
         if not (isinstance(targets, dict) and "stop" in targets):
             raise ValueError("targets must contain 'stop' for stop-mask.")
-        stop = tf.cast(targets["stop"], tf.float32)               # (B,T,1) یا (B,T)
-        if len(stop.shape) == 3 and stop.shape[-1] == 1:
-            stop = tf.squeeze(stop, -1)                           # (B,T)
-        return tf.ones_like(stop, dtype=tf.float32)               # (B,T)
+        stop = tf.cast(targets["stop"], tf.float32)
+        T = tf.shape(stop)[1]
+        mel_len = None
+        if isinstance(inputs, dict) and ("mel_len" in inputs):
+            mel_len = tf.cast(inputs["mel_len"], tf.int32)
+        if mel_len is None:
+            if len(stop.shape) == 3 and stop.shape[-1] == 1:
+                stop = tf.squeeze(stop, -1)
+            return tf.ones_like(stop, dtype=tf.float32)
+        mask = tf.sequence_mask(mel_len + 1, maxlen=T, dtype=tf.float32)  # (B,T)
+        return mask
 
     @staticmethod
     def _masked_mae(y_true, y_pred, mask):
@@ -209,7 +231,7 @@ class TTSLearner(tf.keras.Model):
 
             # ماسک‌ها از تارگت (نه dec_mel)
             frame_mask = self._frame_mask_from_targets(targets)   # (B,T,1)
-            stop_mask  = self._stop_mask_from_targets(targets)    # (B,T)
+            stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
 
             # --- Losses (ماسک‌دار)
             l1_pre  = self._masked_mae(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
@@ -258,7 +280,7 @@ class TTSLearner(tf.keras.Model):
         outputs = self(inputs, training=False)
 
         frame_mask = self._frame_mask_from_targets(targets)   # (B,T,1)
-        stop_mask  = self._stop_mask_from_targets(targets)    # (B,T)
+        stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
 
         l1_pre  = self._masked_mae(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
         l1_post = self._masked_mae(targets["mel_post"], outputs["mel_post"], frame_mask)
@@ -295,14 +317,15 @@ class TTSLearner(tf.keras.Model):
 # ---- Optimizer / LR schedule
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, d_model, warmup_steps=4000):
-        super().__init__(); self.d_model = tf.cast(d_model, tf.float32); self.warmup = float(warmup_steps)
+        super().__init__(); self.d_model = tf.cast(d_model, tf.float32); self.warmup = float(max(1, warmup_steps))
     def __call__(self, step):
         step = tf.cast(step, tf.float32)
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(tf.math.rsqrt(step), step * (self.warmup ** -1.5))
+        warm = tf.maximum(tf.constant(self.warmup, tf.float32), tf.constant(1.0, tf.float32))
+        return tf.math.rsqrt(self.d_model) * tf.math.minimum(tf.math.rsqrt(step), step * (warm ** -1.5))
 
-steps_per_epoch = len(train_gen)
+steps_per_epoch = max(1, len(train_gen))
 optimizer = tf.keras.optimizers.Adam(
-    CustomSchedule(256, warmup_steps=8*steps_per_epoch),
+    CustomSchedule(256, warmup_steps=max(1, 8*steps_per_epoch)),
     beta_1=0.9, beta_2=0.98, epsilon=1e-9, clipnorm=1.0
 )
 
@@ -330,4 +353,5 @@ class SaveCore(tf.keras.callbacks.Callback):
 callbacks = [ckpt_learner, SaveCore(), tb, early]
 
 print("Fitting ...")
-learner.fit(train_gen, validation_data=val_gen, epochs=50, callbacks=callbacks)
+val_data = val_gen if len(val_gen) > 0 else None
+learner.fit(train_gen, validation_data=val_data, epochs=50, callbacks=callbacks)

@@ -1,5 +1,6 @@
 # TTSDataLoader.py
 import os, math, random
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Optional
 
@@ -142,14 +143,16 @@ def wav_to_logmel_tf(wav_path: tf.Tensor, cfg: AudioCfg) -> tf.Tensor:
 class HFTokenizerWrapper:
     def __init__(self, hf_tokenizer: AutoTokenizer, text_cfg: TextCfg):
         self.tok = hf_tokenizer
-        if hasattr(self.tok, "src_lang"):
-            self.tok.src_lang = text_cfg.lang_code
+        # Avoid deprecated attributes (lang_code_to_id / fairseq_tokens_to_ids)
+        # by passing src_lang at encode-time instead of setting tok.src_lang.
+        self.src_lang = text_cfg.lang_code
         self.pad_id = text_cfg.pad_id
         self.eos_id = text_cfg.eos_id
         self.max_len = text_cfg.max_text_len
 
     def encode_ids(self, text: str) -> List[int]:
-        ids = self.tok.encode(text, add_special_tokens=True)
+        # Pass src_lang explicitly to avoid deprecated internals
+        ids = self.tok.encode(text, add_special_tokens=True, src_lang=self.src_lang)
         if self.max_len is not None:
             ids = ids[: self.max_len]
         return ids
@@ -410,22 +413,58 @@ def wav_to_logmel_np(path: str, cfg: AudioCfg) -> np.ndarray:
 def tokenize_texts(items: List[Tuple[str, str]], tok: AutoTokenizer, text_cfg: TextCfg):
     ids_list = []
     for _, txt in items:
-        ids = tok.encode(txt, add_special_tokens=True)[: text_cfg.max_text_len]
+        # Pass src_lang explicitly instead of setting tok.src_lang
+        ids = tok.encode(txt, add_special_tokens=True, src_lang=text_cfg.lang_code)[: text_cfg.max_text_len]
         ids_list.append(np.asarray(ids, dtype=np.int32))
     return ids_list
 
-def preprocess_dataset(root_dir: str, audio_cfg: AudioCfg, text_cfg: TextCfg,tok,metadata_name: str = "metadata.csv"):
+def _mel_worker(args):
+    """Worker for parallel mel computation. args=(wav_path, audio_cfg)"""
+    wav_path, audio_cfg = args
+    mel = wav_to_logmel_np(wav_path, audio_cfg)
+    return mel, mel.shape[0]
 
-
+def preprocess_dataset(
+    root_dir: str,
+    audio_cfg: AudioCfg,
+    text_cfg: TextCfg,
+    tok,
+    metadata_name: str = "metadata.csv",
+    num_workers: int = None,
+):
+    """
+    Offline preprocessing (tokenize + wav→mel) with optional parallel mel computation.
+    num_workers: if None, uses max(1, os.cpu_count()-1). Set to 1 to disable parallelism.
+    """
     items = load_ljspeech_items(root_dir, metadata_name=metadata_name)
     text_ids = tokenize_texts(items, tok, text_cfg)
 
-    mels = []
-    mel_lens = []
-    for i, (wav, _) in enumerate(items):
-        mel = wav_to_logmel_np(wav, audio_cfg)
-        mels.append(mel)
-        mel_lens.append(mel.shape[0])
+    # Decide worker count
+    if num_workers is None:
+        try:
+            hw_threads = os.cpu_count() or 1
+        except Exception:
+            hw_threads = 1
+        num_workers = max(1, hw_threads - 1)
+
+    wav_paths = [wav for (wav, _) in items]
+
+    if num_workers <= 1 or len(wav_paths) <= 1:
+        mels = []
+        mel_lens = []
+        for wav in wav_paths:
+            mel = wav_to_logmel_np(wav, audio_cfg)
+            mels.append(mel)
+            mel_lens.append(mel.shape[0])
+    else:
+        # Parallel computation using process pool
+        args_iter = [(wav, audio_cfg) for wav in wav_paths]
+        mels = []
+        mel_lens = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as ex:
+            for mel, T in ex.map(_mel_worker, args_iter, chunksize=1):
+                mels.append(mel)
+                mel_lens.append(T)
 
     return items, text_ids, mels, np.asarray(mel_lens, dtype=np.int32)
 
@@ -577,9 +616,9 @@ if __name__ == "__main__":
     print("One batch shapes (offline):", {k: v.shape for k, v in x.items()}, {k: v.shape for k, v in y.items()})
 
     # --- Demo: مسیر tf.data (در صورت نیاز) ---
-    tok = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", use_fast=False)
-    if hasattr(tok, "src_lang"):
-        tok.src_lang = "eng_Latn"
+    tok = AutoTokenizer.from_pretrained(
+        "facebook/nllb-200-distilled-600M", use_fast=False, src_lang="eng_Latn"
+    )
     items_tf = load_ljspeech_items(root)
     ds = build_dataset(items_tf, hf_tokenizer=tok, audio_cfg=audio_cfg, text_cfg=text_cfg, pipeline_cfg=PipelineCfg(batch_size=4))
     batch = next(iter(ds.take(1)))

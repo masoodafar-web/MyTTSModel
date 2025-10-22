@@ -116,10 +116,22 @@ class BaseAttentionPreNorm(layers.Layer):
 
     def call(self, x, *, context=None, attn_mask=None, q_valid=None, training=False):
         xn = self.norm(x)
+        # Normalize attention_mask semantics across TF versions:
+        # Convert boolean "allowed" masks to additive bias: 0 for allowed, -1e9 for blocked.
+        attn_bias = None
+        if attn_mask is not None:
+            if attn_mask.dtype == tf.bool:
+                # Here, True means "allowed" in our code. Convert to bias where blocked -> -1e9
+                zeros = tf.zeros_like(tf.cast(attn_mask, tf.float32))
+                neginf = tf.fill(tf.shape(attn_mask), tf.constant(-1e9, tf.float32))
+                attn_bias = tf.where(attn_mask, zeros, neginf)
+            else:
+                attn_bias = tf.cast(attn_mask, tf.float32)
+
         if context is None:
-            h = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_mask, training=training)
+            h = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_bias, training=training)
         else:
-            h = self.mha(query=xn, key=context, value=context, attention_mask=attn_mask, training=training)
+            h = self.mha(query=xn, key=context, value=context, attention_mask=attn_bias, training=training)
         if q_valid is not None:
             h *= tf.cast(q_valid[..., None], h.dtype)
         h = self.res_dropout(h, training=training)

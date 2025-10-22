@@ -1,0 +1,73 @@
+# --- Python basics ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs & checkpoints ---
+logs/
+checkpoints/
+lightning_logs/
+runs/
+tb_logs/
+wandb/
+mlruns/
+multirun/
+outputs/
+*.log
+events.out.tfevents*
+
+# --- Model artifacts (TTS/ML) ---
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.onnx
+*.tflite
+*.safetensors
+*.bin
+
+# --- (Optional) data dirs — uncomment if desired ---
+# data/
+# datasets/
+# samples/
+# outputs/audio/
+
+# --- Envs & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Caches & tooling ---
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pylint.d/
+.coverage*
+coverage.xml
+pip-log.txt
+
+# --- Editor/OS ---
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# --- Build artifacts ---
+build/
+dist/
+*.egg-info/
+*.egg
+
+__pycache__/
+logs/
