@@ -2,12 +2,19 @@
 Centralized configuration for MyTTS model, training, and inference.
 
 Provides:
-- Model presets: tiny, normal, large
+- Model presets: tiny, normal, large (classical architecture)
+- Model presets: modern_small, modern_base, modern_large (with RoPE + SwiGLU)
 - Greedy decoding defaults with adaptive helpers
 
 Usage:
     from TTSConfig import get_model_preset, GreedyDefaults, compute_greedy_params
+    
+    # Use classical preset
     mcfg = get_model_preset("normal")
+    
+    # Use modern preset with RoPE and SwiGLU
+    mcfg = get_model_preset("modern_base")
+    
     params = compute_greedy_params(token_len, GreedyDefaults())
 """
 
@@ -27,6 +34,9 @@ class ModelConfig:
     prenet_drop: float = 0.5
     cross_win: Optional[float] = 0.2
     max_length: int = 4096
+    # New architectural options
+    activation: str = 'gelu'  # 'gelu' or 'swiglu'
+    pos_encoding_type: str = 'sinusoidal'  # 'sinusoidal' or 'rope'
 
 
 # Presets tuned for this repo; "normal" matches training defaults
@@ -42,6 +52,22 @@ PRESETS: Dict[str, ModelConfig] = {
     "large": ModelConfig(
         num_layers=12, d_model=768, num_heads=12, dff=3072,
         dropout_rate=0.1, droppath_rate=0.1, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+    ),
+    # Modern presets with new architectural features
+    "modern_small": ModelConfig(
+        num_layers=6, d_model=512, num_heads=8, dff=2048,
+        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        activation='swiglu', pos_encoding_type='rope'
+    ),
+    "modern_base": ModelConfig(
+        num_layers=8, d_model=512, num_heads=8, dff=2048,
+        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        activation='swiglu', pos_encoding_type='rope'
+    ),
+    "modern_large": ModelConfig(
+        num_layers=12, d_model=768, num_heads=12, dff=3072,
+        dropout_rate=0.1, droppath_rate=0.1, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        activation='swiglu', pos_encoding_type='rope'
     ),
 }
 

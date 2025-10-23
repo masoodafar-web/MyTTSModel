@@ -4,7 +4,10 @@ A complete implementation of a Transformer-based Text-to-Speech (TTS) system bui
 
 ## 🎯 Features
 
-- **Transformer Architecture**: Encoder-decoder with multi-head attention
+- **Modern Transformer Architecture**: Encoder-decoder with multi-head attention
+  - **NEW**: Rotary Position Embedding (RoPE) support for improved position awareness
+  - **NEW**: SwiGLU activation option for better representation learning
+  - Stochastic depth (DropPath) for improved regularization
 - **Multilingual Support**: Uses NLLB tokenizer for text encoding
 - **PostNet Refinement**: Convolutional post-processing for improved mel quality
 - **Advanced Training**:
@@ -13,8 +16,16 @@ A complete implementation of a Transformer-based Text-to-Speech (TTS) system bui
   - Exponential Moving Average (EMA) of weights
   - Guided Attention Loss (GAL) with ramp-up
   - Dynamic stop token weighting
+  - **NEW**: Adaptive gradient clipping strategies
+- **Advanced Inference**:
+  - Autoregressive generation with learnable go-frame
+  - **NEW**: Temperature-based sampling for generation diversity
+  - Configurable stop criteria with patience mechanism
+- **Monitoring & Debugging**:
+  - **NEW**: Alignment visualization utilities
+  - **NEW**: Gradient analysis tools
+  - **NEW**: Comprehensive metrics aggregation
 - **Flexible Data Loading**: Both online (tf.data) and offline (NumPy) approaches
-- **Efficient Inference**: Autoregressive generation with learnable go-frame
 - **Comprehensive Documentation**: Full docstrings in Persian and English
 
 ## 📋 Requirements
@@ -348,6 +359,116 @@ start doc/index.html  # Windows
 
 ## 🔧 Advanced Configuration
 
+### Modern Architectural Features (NEW)
+
+#### Rotary Position Embedding (RoPE)
+
+Use RoPE instead of sinusoidal position encoding for improved relative position awareness:
+
+```python
+model_core = TransformerTTS(
+    num_layers=8,
+    d_model=512,
+    num_heads=8,
+    dff=2048,
+    input_vocab_size=len(tok),
+    n_mels=80,
+    pos_encoding_type='rope',  # Use RoPE instead of sinusoidal
+    # ... other params
+)
+```
+
+RoPE (Rotary Position Embedding) provides better relative position awareness and is used in modern LLMs like LLaMA and PaLM.
+
+#### SwiGLU Activation
+
+Use SwiGLU activation for improved representation learning:
+
+```python
+model_core = TransformerTTS(
+    num_layers=8,
+    d_model=512,
+    num_heads=8,
+    dff=2048,
+    input_vocab_size=len(tok),
+    n_mels=80,
+    activation='swiglu',  # Use SwiGLU instead of GELU
+    # ... other params
+)
+```
+
+SwiGLU (Swish-Gated Linear Unit) uses a gating mechanism for better gradient flow and has shown improvements in various transformer architectures.
+
+#### Temperature-Based Sampling
+
+Control generation diversity with temperature parameter:
+
+```python
+# Greedy generation (temperature=1.0, default)
+mel_hat, stop_probs = model_core.greedy_generate_fast(
+    enc_ids,
+    max_steps=600,
+    temperature=1.0  # Deterministic
+)
+
+# More diverse generation (temperature>1.0)
+mel_hat, stop_probs = model_core.greedy_generate_fast(
+    enc_ids,
+    max_steps=600,
+    temperature=1.2  # More variation in mel predictions
+)
+```
+
+Higher temperature values (>1.0) add controlled randomness to generation, which can improve naturalness in some cases.
+
+### Using Monitoring Tools
+
+The new `TTSMonitoring` module provides utilities for debugging and analysis:
+
+```python
+from TTSMonitoring import (
+    extract_alignment_from_model,
+    compute_alignment_diagonality,
+    visualize_alignment_matrix,
+    analyze_gradients,
+    adaptive_gradient_clipping,
+    MetricsAggregator
+)
+
+# Extract and visualize attention alignment
+alignment = extract_alignment_from_model(model, enc_ids, mel_target)
+diag_score = compute_alignment_diagonality(alignment)
+print(f"Alignment diagonality: {diag_score:.4f}")
+
+# Visualize alignment (requires matplotlib)
+fig = visualize_alignment_matrix(
+    alignment[0].numpy(),
+    save_path="alignment.png",
+    title="Attention Alignment"
+)
+
+# Analyze gradients during training
+grad_stats = analyze_gradients(model, loss, max_norm=1.0)
+print(f"Gradient stats: {grad_stats}")
+
+# Adaptive gradient clipping
+grads = tape.gradient(loss, model.trainable_variables)
+clipped_grads, global_norm = adaptive_gradient_clipping(
+    grads, 
+    max_norm=1.0,
+    norm_type='percentile'  # Options: 'global', 'per_layer', 'percentile'
+)
+
+# Track metrics over time
+aggregator = MetricsAggregator(window_size=100)
+for step in training_loop:
+    aggregator.update({"loss": loss_value, "accuracy": acc_value})
+    
+    if step % 100 == 0:
+        stats = aggregator.get_all_statistics()
+        print(f"Recent metrics: {stats}")
+```
+
 ### Multilingual Training (Persian Example)
 
 ```python
@@ -410,6 +531,45 @@ learner = TTSLearner(
 2. Decrease `ga_sigma` for stricter diagonal
 3. Ensure proper data preprocessing
 4. Check that text and audio are correctly paired
+5. **NEW**: Use alignment visualization to diagnose issues:
+   ```python
+   from TTSMonitoring import extract_alignment_from_model, visualize_alignment_matrix
+   alignment = extract_alignment_from_model(model, enc_ids, mel_target)
+   visualize_alignment_matrix(alignment[0].numpy(), save_path="debug_alignment.png")
+   ```
+
+### Gradient Issues
+
+**NEW**: Use gradient analysis to detect vanishing/exploding gradients:
+
+```python
+from TTSMonitoring import analyze_gradients
+
+grad_stats = analyze_gradients(model, loss)
+if "warning" in grad_stats:
+    print(f"Warning: {grad_stats['warning']}")
+    # Consider adjusting learning rate or using adaptive clipping
+```
+
+### Training Instability
+
+**NEW**: Use adaptive gradient clipping for better stability:
+
+```python
+from TTSMonitoring import adaptive_gradient_clipping
+
+# In training loop
+grads = tape.gradient(loss, model.trainable_variables)
+
+# Use percentile-based clipping for adaptive behavior
+clipped_grads, global_norm = adaptive_gradient_clipping(
+    grads,
+    max_norm=1.0,
+    norm_type='percentile'
+)
+
+optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
+```
 
 ### Slow Training
 
@@ -417,6 +577,7 @@ learner = TTSLearner(
 2. Use mel-spectrogram caching
 3. Increase `num_workers` for data loading
 4. Use multi-GPU training
+5. **NEW**: Consider using SwiGLU activation which can converge faster
 
 ## 📝 Citation
 
@@ -445,6 +606,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [Tacotron 2](https://arxiv.org/abs/1712.05884)
 - [Guided Attention Loss](https://arxiv.org/abs/1710.08969)
 - [NLLB Tokenizer](https://huggingface.co/facebook/nllb-200-distilled-600M)
+- **NEW**: [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
+- **NEW**: [GLU Variants Improve Transformer (SwiGLU)](https://arxiv.org/abs/2002.05202)
+- **NEW**: [Deep Residual Learning: DropPath/Stochastic Depth](https://arxiv.org/abs/1603.09382)
 
 ## 📧 Contact
 
