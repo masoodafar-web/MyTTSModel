@@ -47,6 +47,71 @@ def positional_encoding(length, d_model):
     pos[:, 1::2] = np.cos(angle_rads[:, 1::2])
     return tf.convert_to_tensor(pos, dtype=tf.float32)
 
+
+class RotaryPositionEmbedding(layers.Layer):
+    """
+    Rotary Position Embedding (RoPE) for improved position encoding.
+    
+    RoPE applies rotation to query and key vectors based on their absolute positions,
+    providing better relative position awareness compared to additive position encodings.
+    This is a modern alternative used in models like LLaMA and PaLM.
+    
+    Args:
+        d_model (int): Model dimension (must be even).
+        max_length (int): Maximum sequence length. Default: 4096.
+        base (float): Base for frequency calculation. Default: 10000.0.
+        name (str, optional): Layer name.
+    
+    Reference:
+        RoFormer: Enhanced Transformer with Rotary Position Embedding
+        https://arxiv.org/abs/2104.09864
+    """
+    
+    def __init__(self, d_model, max_length=4096, base=10000.0, name=None):
+        super().__init__(name=name)
+        if d_model % 2 != 0:
+            raise ValueError(f"d_model must be even for RoPE, got {d_model}")
+        self.d_model = d_model
+        self.max_length = max_length
+        self.base = base
+        
+        # Precompute rotation matrices
+        inv_freq = 1.0 / (base ** (np.arange(0, d_model, 2).astype(np.float32) / d_model))
+        position = np.arange(max_length, dtype=np.float32)
+        freqs = np.outer(position, inv_freq)  # (max_length, d_model//2)
+        
+        # Create sin and cos for rotation
+        self.cos_cached = tf.convert_to_tensor(np.cos(freqs), dtype=tf.float32)  # (L, D/2)
+        self.sin_cached = tf.convert_to_tensor(np.sin(freqs), dtype=tf.float32)  # (L, D/2)
+    
+    def call(self, x):
+        """
+        Apply rotary position embedding to input tensor.
+        
+        Args:
+            x (tf.Tensor): Input of shape (batch_size, seq_len, d_model).
+            
+        Returns:
+            tf.Tensor: Position-encoded tensor of same shape.
+        """
+        seq_len = tf.shape(x)[1]
+        
+        # Get cached sin/cos for current sequence length
+        cos = self.cos_cached[:seq_len, :]  # (T, D/2)
+        sin = self.sin_cached[:seq_len, :]  # (T, D/2)
+        
+        # Split features into pairs and apply rotation
+        x1, x2 = tf.split(x, 2, axis=-1)  # Each (B, T, D/2)
+        
+        # Broadcast and apply rotation: [cos*x1 - sin*x2, sin*x1 + cos*x2]
+        cos = tf.cast(cos, x.dtype)[None, :, :]  # (1, T, D/2)
+        sin = tf.cast(sin, x.dtype)[None, :, :]  # (1, T, D/2)
+        
+        rotated_x1 = x1 * cos - x2 * sin
+        rotated_x2 = x1 * sin + x2 * cos
+        
+        return tf.concat([rotated_x1, rotated_x2], axis=-1)  # (B, T, D)
+
 # =========================
 # Embeddings
 # =========================
@@ -335,25 +400,44 @@ class FeedForwardPreNorm(layers.Layer):
     """
     Feed-forward network with pre-normalization and residual connection.
     
-    Implements a two-layer FFN with GELU activation, pre-LayerNorm,
-    dropout, and optional DropPath for regularization.
+    Implements a two-layer FFN with configurable activation (GELU or SwiGLU),
+    pre-LayerNorm, dropout, and optional DropPath for regularization.
+    
+    SwiGLU uses gating mechanism for improved representation learning:
+        SwiGLU(x) = (W1*x * swish(W_gate*x)) * W2
     
     Args:
         d_model (int): Model dimension.
         dff (int): Feed-forward intermediate dimension.
         dropout (float): Dropout rate. Default: 0.1.
         droppath (float): DropPath rate. Default: 0.0.
+        activation (str): Activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
         name (str, optional): Layer name.
+        
+    Reference:
+        GLU Variants Improve Transformer (SwiGLU)
+        https://arxiv.org/abs/2002.05202
     """
     
-    def __init__(self, d_model, dff, dropout=0.1, droppath=0.0, name=None):
+    def __init__(self, d_model, dff, dropout=0.1, droppath=0.0, activation='gelu', name=None):
         super().__init__(name=name)
+        self.activation_type = activation
         self.norm = layers.LayerNormalization(epsilon=1e-5, name="ln")
-        self.seq = tf.keras.Sequential([
-            layers.Dense(dff, activation=tf.keras.activations.gelu, name="fc1"),
-            layers.Dropout(dropout, name="drop"),
-            layers.Dense(d_model, name="fc2"),
-        ], name="ff")
+        
+        if activation == 'swiglu':
+            # SwiGLU uses gated mechanism, requires two projections to dff
+            self.w1 = layers.Dense(dff, name="w1")
+            self.w_gate = layers.Dense(dff, name="w_gate")
+            self.dropout1 = layers.Dropout(dropout, name="drop1")
+            self.w2 = layers.Dense(d_model, name="w2")
+        else:
+            # Standard GELU FFN
+            self.seq = tf.keras.Sequential([
+                layers.Dense(dff, activation=tf.keras.activations.gelu, name="fc1"),
+                layers.Dropout(dropout, name="drop"),
+                layers.Dense(d_model, name="fc2"),
+            ], name="ff")
+        
         self.res_dropout = layers.Dropout(dropout, name="res_drop")
         self.drop_path = DropPath(droppath, name="droppath") if droppath > 0 else None
         self.add = layers.Add(name="add")
@@ -370,7 +454,17 @@ class FeedForwardPreNorm(layers.Layer):
             tf.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
         """
         h = self.norm(x)
-        h = self.seq(h, training=training)
+        
+        if self.activation_type == 'swiglu':
+            # Apply SwiGLU: (W1*x * swish(W_gate*x)) * W2
+            gate = tf.nn.swish(self.w_gate(h))
+            h = self.w1(h) * gate
+            h = self.dropout1(h, training=training)
+            h = self.w2(h)
+        else:
+            # Standard GELU FFN
+            h = self.seq(h, training=training)
+        
         h = self.res_dropout(h, training=training)
         if self.drop_path is not None:
             h = self.drop_path(h, training=training)
@@ -389,15 +483,17 @@ class EncoderLayer(layers.Layer):
         dff (int): Feed-forward intermediate dimension.
         dropout_rate (float): Dropout rate. Default: 0.1.
         droppath (float): DropPath rate. Default: 0.0.
+        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
         name (str, optional): Layer name.
     """
     
-    def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1, droppath=0.0, name=None):
+    def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1, droppath=0.0, activation='gelu', name=None):
         super().__init__(name=name)
         self.self_attention = BaseAttentionPreNorm(
             num_heads=num_heads, d_model=d_model, dropout=dropout_rate, droppath=droppath, name="self_attn"
         )
-        self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, name="ffn")
+        self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, 
+                                     activation=activation, name="ffn")
 
     def call(self, x, key_mask=None, q_valid=None, training=False):
         """
@@ -426,10 +522,11 @@ class DecoderLayer(layers.Layer):
         dff (int): Feed-forward intermediate dimension.
         dropout_rate (float): Dropout rate. Default: 0.1.
         droppath (float): DropPath rate. Default: 0.0.
+        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
         name (str, optional): Layer name.
     """
     
-    def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1, droppath=0.0, name=None):
+    def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1, droppath=0.0, activation='gelu', name=None):
         super().__init__(name=name)
         self.causal_self_attention = BaseAttentionPreNorm(
             num_heads=num_heads, d_model=d_model, dropout=dropout_rate, droppath=droppath, name="causal_self_attn"
@@ -437,7 +534,8 @@ class DecoderLayer(layers.Layer):
         self.cross_attention = BaseAttentionPreNorm(
             num_heads=num_heads, d_model=d_model, dropout=dropout_rate, droppath=droppath, name="cross_attn"
         )
-        self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, name="ffn")
+        self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, 
+                                     activation=activation, name="ffn")
 
     def call(self, x, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False, need_attn=False):
         """
@@ -475,7 +573,7 @@ class Encoder(tf.keras.Model):
     Transformer encoder stack for text encoding.
     
     Stacks multiple encoder layers with optional stochastic depth (DropPath).
-    Includes token embedding with positional encoding and input dropout.
+    Includes token embedding with positional encoding (sinusoidal or RoPE) and input dropout.
     
     Args:
         num_layers (int): Number of encoder layers.
@@ -485,20 +583,28 @@ class Encoder(tf.keras.Model):
         vocab_size (int): Vocabulary size.
         dropout_rate (float): Dropout rate. Default: 0.1.
         droppath_rate (float): Maximum DropPath rate (linearly increases across layers). Default: 0.0.
+        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
+        pos_encoding_type (str): Position encoding: 'sinusoidal' or 'rope'. Default: 'sinusoidal'.
         name (str): Model name. Default: "encoder".
     """
     
     def __init__(self, *, num_layers, d_model, num_heads, dff, vocab_size,
-                 dropout_rate=0.1, droppath_rate=0.0, name="encoder"):
+                 dropout_rate=0.1, droppath_rate=0.0, activation='gelu', 
+                 pos_encoding_type='sinusoidal', name="encoder"):
         super().__init__(name=name)
+        self.pos_encoding_type = pos_encoding_type
         self.pos_embedding = PositionalEmbedding(vocab_size=vocab_size, d_model=d_model, name="tokpos")
+        
+        if pos_encoding_type == 'rope':
+            self.rope = RotaryPositionEmbedding(d_model=d_model, name="rope")
+        
         self.dropout = layers.Dropout(dropout_rate, name="dropout")
         self.layers_ = []
         for i in range(num_layers):
             dp = 0.0 if droppath_rate == 0.0 else droppath_rate * (i / max(1, num_layers - 1))
             self.layers_.append(
                 EncoderLayer(d_model=d_model, num_heads=num_heads, dff=dff,
-                             dropout_rate=dropout_rate, droppath=dp, name=f"block_{i}")
+                             dropout_rate=dropout_rate, droppath=dp, activation=activation, name=f"block_{i}")
             )
 
     def call(self, ids, key_mask=None, q_valid=None, training=False):
@@ -515,6 +621,10 @@ class Encoder(tf.keras.Model):
             tf.Tensor: Encoded representations of shape (batch_size, seq_len, d_model).
         """
         x = self.pos_embedding(ids)
+        
+        if self.pos_encoding_type == 'rope':
+            x = self.rope(x)
+        
         x = self.dropout(x, training=training)
         for lyr in self.layers_:
             x = lyr(x, key_mask=key_mask, q_valid=q_valid, training=training)
@@ -538,11 +648,12 @@ class DecoderTTS(tf.keras.Model):
         name (str): Model name. Default: "decoder_tts".
         use_prenet (bool): Whether to use prenet layers. Default: True.
         prenet_drop (float): Prenet dropout rate. Default: 0.5.
+        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
     """
     
     def __init__(self, *, num_layers, d_model, num_heads, dff, n_mels,
                  dropout_rate=0.1, droppath_rate=0.0, name="decoder_tts",
-                 use_prenet=True, prenet_drop=0.5):
+                 use_prenet=True, prenet_drop=0.5, activation='gelu'):
         super().__init__(name=name)
         self.mel_proj = MelPositionalProjection(n_mels=n_mels, d_model=d_model,
                                                 name="melpos", use_prenet=use_prenet, prenet_drop=prenet_drop)
@@ -552,7 +663,7 @@ class DecoderTTS(tf.keras.Model):
             dp = 0.0 if droppath_rate == 0.0 else droppath_rate * (i / max(1, num_layers - 1))
             self.layers_.append(
                 DecoderLayer(d_model=d_model, num_heads=num_heads, dff=dff,
-                             dropout_rate=dropout_rate, droppath=dp, name=f"block_{i}")
+                             dropout_rate=dropout_rate, droppath=dp, activation=activation, name=f"block_{i}")
             )
 
     def call(self, mel_in, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False, return_attn=False):
@@ -685,7 +796,8 @@ class TransformerTTS(tf.keras.Model):
     def __init__(self, *, num_layers, d_model, num_heads, dff,
                  input_vocab_size, n_mels,
                  dropout_rate=0.1, pad_id=1, droppath_rate=0.0, max_length=4096,
-                 use_prenet=True, prenet_drop=0.5, cross_win=None, name="TransformerTTS"):
+                 use_prenet=True, prenet_drop=0.5, cross_win=None, 
+                 activation='gelu', pos_encoding_type='sinusoidal', name="TransformerTTS"):
         super().__init__(name=name)
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
@@ -699,13 +811,18 @@ class TransformerTTS(tf.keras.Model):
                                num_heads=num_heads, dff=dff,
                                vocab_size=input_vocab_size,
                                dropout_rate=dropout_rate,
-                               droppath_rate=droppath_rate, name="encoder")
+                               droppath_rate=droppath_rate, 
+                               activation=activation,
+                               pos_encoding_type=pos_encoding_type,
+                               name="encoder")
         self.decoder = DecoderTTS(num_layers=num_layers, d_model=d_model,
                                   num_heads=num_heads, dff=dff,
                                   n_mels=n_mels,
                                   dropout_rate=dropout_rate,
                                   droppath_rate=droppath_rate,
-                                  use_prenet=use_prenet, prenet_drop=prenet_drop, name="decoder")
+                                  use_prenet=use_prenet, prenet_drop=prenet_drop, 
+                                  activation=activation,
+                                  name="decoder")
 
         self.mel_head = layers.Dense(n_mels, name="mel_head")
         self.stop_head = layers.Dense(1, name="stop_head")
@@ -881,9 +998,9 @@ class TransformerTTS(tf.keras.Model):
                              max_steps=600, min_steps=120,
                              stop_threshold=0.9, window=8, patience=4,
                              check_stop_every=5, verbose=True,
-                             use_postnet=True, return_pre=False):
+                             use_postnet=True, return_pre=False, temperature=1.0):
         """
-        Generate mel-spectrogram autoregressively using greedy decoding.
+        Generate mel-spectrogram autoregressively using greedy decoding with optional temperature.
         
         Generates mel frames one at a time starting from a learnable go-frame,
         stopping when the model predicts high stop probability consistently.
@@ -891,12 +1008,15 @@ class TransformerTTS(tf.keras.Model):
         Args:
             enc_ids (tf.Tensor): Encoder input IDs of shape (batch_size, src_len).
             max_steps (int): Maximum generation steps. Default: 600.
-            min_steps (int): Minimum generation steps before checking stop condition. Default: 40.
-            stop_threshold (float): Threshold for stop probability. Default: 0.6.
-            window (int): Number of recent frames to average for stop decision. Default: 5.
-            patience (int): Number of consecutive windows above threshold before stopping. Default: 3.
-            check_stop_every (int): Check stop condition every N steps. Default: 10.
+            min_steps (int): Minimum generation steps before checking stop condition. Default: 120.
+            stop_threshold (float): Threshold for stop probability. Default: 0.9.
+            window (int): Number of recent frames to average for stop decision. Default: 8.
+            patience (int): Number of consecutive windows above threshold before stopping. Default: 4.
+            check_stop_every (int): Check stop condition every N steps. Default: 5.
             verbose (bool): Whether to print progress. Default: True.
+            use_postnet (bool): Whether to apply PostNet refinement. Default: True.
+            return_pre (bool): Whether to return pre-PostNet mel. Default: False.
+            temperature (float): Temperature for mel prediction sampling (1.0=greedy, >1.0=more random). Default: 1.0.
             
         Returns:
             tuple: If return_pre=False → (mel_hat, stop_probs)
@@ -927,6 +1047,15 @@ class TransformerTTS(tf.keras.Model):
                                  training=False)
 
             mel_next_pre = tf.cast(self.mel_head(dec_h)[:, -1:, :], tf.float32)
+            
+            # Apply temperature scaling if temperature != 1.0
+            if temperature != 1.0 and temperature > 0.0:
+                # Add small noise proportional to temperature for exploration
+                noise = tf.random.normal(tf.shape(mel_next_pre), mean=0.0, stddev=0.1 * temperature, dtype=tf.float32)
+                mel_next_pre = mel_next_pre + noise
+                # Clip to valid range
+                mel_next_pre = tf.clip_by_value(mel_next_pre, -1.0, 1.0)
+            
             stop_prob    = tf.cast(tf.sigmoid(self.stop_head(dec_h))[:, -1:, :], tf.float32)
 
             mel_list.append(mel_next_pre)

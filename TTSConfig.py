@@ -27,6 +27,9 @@ class ModelConfig:
     prenet_drop: float = 0.5
     cross_win: Optional[float] = 0.2
     max_length: int = 4096
+    # New architectural options
+    activation: str = 'gelu'  # 'gelu' or 'swiglu'
+    pos_encoding_type: str = 'sinusoidal'  # 'sinusoidal' or 'rope'
 
 
 # Presets tuned for this repo; "normal" matches training defaults
