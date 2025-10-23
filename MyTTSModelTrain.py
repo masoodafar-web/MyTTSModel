@@ -348,10 +348,10 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
             n_mels=data_split['n_mels'],
             dropout_rate=model_config.dropout_rate,
             pad_id=text_cfg.pad_id,
-            use_prenet=model_config.use_prenet,
-            prenet_drop=model_config.prenet_drop,
-            droppath_rate=model_config.droppath_rate,
-            cross_win=model_config.cross_win
+            use_prenet=getattr(model_config, 'use_prenet', True),
+            prenet_drop=getattr(model_config, 'prenet_drop', 0.5),
+            droppath_rate=getattr(model_config, 'droppath_rate', 0.0),
+            cross_win=getattr(model_config, 'cross_win', None)
         )
 
         # Build model with actual input shapes
@@ -1233,6 +1233,12 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
                     # Restore original policy
                     tf.keras.mixed_precision.set_global_policy(original_policy)
 
+                # Log to TensorBoard
+                self._log_sample_to_tensorboard(text, mel_pred, stop_probs, i)
+
+            except Exception as e:
+                print(f"   ❌ Sample {i} failed: {e}")
+
                 # Save sample data
                 sample_data = {
                     'text': text,
@@ -1255,7 +1261,10 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
                 print(f"   ❌ Sample {i} failed: {e}")
 
         # Generate comparison plot
-        self._generate_comparison_plot()
+        try:
+            self._generate_comparison_plot()
+        except Exception as e:
+            print(f"   ⚠️ Comparison plot failed: {e}")
 
     def _cleanup_old_samples(self):
         """Keep only the most recent samples."""
@@ -1519,11 +1528,11 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
     @staticmethod
     def _griffin_lim(mag, n_iter=30):
         """Simple Griffin-Lim algorithm for phase reconstruction."""
-        mag = tf.cast(mag, tf.complex64)
+        mag = tf.cast(mag, tf.float32)  # Keep as float32, not complex64
 
         # Random initial phase
         phase = tf.exp(1j * tf.random.uniform(tf.shape(mag), 0, 2*np.pi, dtype=tf.float32))
-        S = mag * phase
+        S = tf.cast(mag, tf.complex64) * phase
 
         for _ in range(n_iter):
             # ISTFT
@@ -1543,7 +1552,7 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
             )
 
             # Update phase
-            S = mag * tf.exp(1j * tf.angle(S))
+            S = tf.cast(mag, tf.complex64) * tf.exp(1j * tf.angle(S))
 
         # Final ISTFT
         wav = tf.signal.inverse_stft(

@@ -926,8 +926,8 @@ class TransformerTTS(tf.keras.Model):
                                  q_valid=dec_valid,
                                  training=False)
 
-            mel_next_pre = self.mel_head(dec_h)[:, -1:, :]
-            stop_prob    = tf.sigmoid(self.stop_head(dec_h))[:, -1:, :]
+            mel_next_pre = tf.cast(self.mel_head(dec_h)[:, -1:, :], tf.float32)
+            stop_prob    = tf.cast(tf.sigmoid(self.stop_head(dec_h))[:, -1:, :], tf.float32)
 
             mel_list.append(mel_next_pre)
             stop_list.append(stop_prob)
@@ -937,7 +937,7 @@ class TransformerTTS(tf.keras.Model):
 
             if (t + 1) >= min_steps and ((t + 1) % check_stop_every) == 0:
                 k = min(window, t + 1)
-                last_probs = tf.concat(stop_list[-k:], axis=1)
+                last_probs = tf.concat([tf.cast(s, tf.float32) for s in stop_list[-k:]], axis=1)
                 mean_prob  = tf.reduce_mean(last_probs, axis=1)
                 if float(tf.reduce_all(mean_prob > stop_threshold).numpy()):
                     strike += 1
@@ -947,11 +947,11 @@ class TransformerTTS(tf.keras.Model):
                 else:
                     strike = 0
 
-            mel_step = tf.concat([mel_step, mel_next_pre], axis=1)
+            mel_step = tf.concat([tf.cast(mel_step, tf.float32), mel_next_pre], axis=1)
 
         mel_pre  = tf.concat(mel_list, axis=1)  if mel_list  else tf.zeros([B, 0, self.n_mels], tf.float32)
         if use_postnet:
-            mel_hat = mel_pre + self.postnet(mel_pre, training=False)
+            mel_hat = mel_pre + tf.cast(self.postnet(mel_pre, training=False), tf.float32)
         else:
             mel_hat = mel_pre
         stop_probs = tf.concat(stop_list, axis=1) if stop_list else tf.zeros([B, 0, 1], tf.float32)
