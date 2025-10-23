@@ -947,7 +947,10 @@ class TransformerTTS(tf.keras.Model):
                 else:
                     strike = 0
 
-            mel_step = tf.concat([tf.cast(mel_step, tf.float32), mel_next_pre], axis=1)
+            # Ensure dtype consistency for concat operation
+            mel_step = tf.cast(mel_step, tf.float32)
+            mel_next_pre = tf.cast(mel_next_pre, tf.float32)
+            mel_step = tf.concat([mel_step, mel_next_pre], axis=1)
 
         mel_pre  = tf.concat(mel_list, axis=1)  if mel_list  else tf.zeros([B, 0, self.n_mels], tf.float32)
         if use_postnet:

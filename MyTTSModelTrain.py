@@ -1198,18 +1198,41 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
                 print(f"⚠️ Sample generation failed: {e}")
 
     def _generate_samples(self):
-        """Generate and save sample predictions."""
+        """Generate and save sample predictions with enhanced validation."""
         print(f"\n🎵 Generating samples at step {self.step_count}...")
+
+        # Validate inputs
+        if not self.text_samples:
+            print("   ⚠️ No text samples provided")
+            return
+
+        if not hasattr(self.model, 'core') or self.model.core is None:
+            print("   ⚠️ Model not properly initialized")
+            return
 
         # Clean up old samples
         self._cleanup_old_samples()
 
         for i, text in enumerate(self.text_samples):
+            # Validate text input
+            if not isinstance(text, str) or len(text.strip()) == 0:
+                print(f"   ⚠️ Invalid text sample {i}: must be non-empty string")
+                continue
+
             try:
-                # Tokenize text
+                # Tokenize text with validation
                 tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+                if len(tokens) == 0:
+                    print(f"   ⚠️ Tokenization failed for sample {i}")
+                    continue
+
                 tokens = tokens[:256]  # Truncate if too long
                 input_ids = tf.constant([tokens], dtype=tf.int32)
+
+                # Validate input shape
+                if input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+                    print(f"   ⚠️ Invalid input shape for sample {i}: {input_ids.shape}")
+                    continue
 
                 # Generate mel-spectrogram with proper mixed precision handling
                 # Temporarily switch to float32 policy for inference
@@ -1225,9 +1248,22 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
                         verbose=False
                     )
 
+                    # Validate outputs
+                    if mel_pred is None or stop_probs is None:
+                        print(f"   ⚠️ Model returned None outputs for sample {i}")
+                        continue
+
                     # Ensure outputs are float32
                     mel_pred = tf.cast(mel_pred, tf.float32)
                     stop_probs = tf.cast(stop_probs, tf.float32)
+
+                    # Validate output shapes
+                    if mel_pred.shape[0] != 1 or mel_pred.shape[2] != audio_cfg.n_mels:
+                        print(f"   ⚠️ Invalid mel output shape for sample {i}: {mel_pred.shape}")
+                        continue
+                    if stop_probs.shape[0] != 1:
+                        print(f"   ⚠️ Invalid stop probs shape for sample {i}: {stop_probs.shape}")
+                        continue
 
                 finally:
                     # Restore original policy
@@ -1235,9 +1271,6 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
 
                 # Log to TensorBoard
                 self._log_sample_to_tensorboard(text, mel_pred, stop_probs, i)
-
-            except Exception as e:
-                print(f"   ❌ Sample {i} failed: {e}")
 
                 # Save sample data
                 sample_data = {
@@ -1333,6 +1366,57 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
         mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
         return mel_01 * 100.0 - 100.0    # -> [-100, 0] dB
 
+    def _log_sample_to_tensorboard(self, text, mel_pred, stop_probs, sample_idx):
+        """Log generated sample to TensorBoard for monitoring training progress."""
+        try:
+            import tensorflow as tf
+
+            # Create summary writer if not exists
+            if not hasattr(self, '_summary_writer'):
+                log_dir = f"logs/tts/samples_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                self._summary_writer = tf.summary.create_file_writer(log_dir)
+
+            with self._summary_writer.as_default():
+                # Log mel-spectrogram as image
+                mel_db = self._mel_to_db(mel_pred.numpy()[0])  # Convert to dB for better visualization
+                mel_image = tf.expand_dims(mel_db, [0, -1])  # Add batch and channel dims
+                mel_image = tf.image.resize(mel_image, [128, 256])  # Resize for display
+
+                tf.summary.image(
+                    name=f"sample_{sample_idx}_mel",
+                    data=mel_image,
+                    step=self.step_count,
+                    description=f"Generated mel-spectrogram for: '{text[:50]}...'"
+                )
+
+                # Log stop probabilities as scalar
+                avg_stop_prob = tf.reduce_mean(stop_probs).numpy()
+                tf.summary.scalar(
+                    name=f"sample_{sample_idx}_avg_stop_prob",
+                    data=avg_stop_prob,
+                    step=self.step_count,
+                    description="Average stop probability for generated sample"
+                )
+
+                # Log sequence length
+                seq_length = mel_pred.shape[1]
+                tf.summary.scalar(
+                    name=f"sample_{sample_idx}_seq_length",
+                    data=seq_length,
+                    step=self.step_count,
+                    description="Generated sequence length in frames"
+                )
+
+                # Log text as text summary
+                tf.summary.text(
+                    name=f"sample_{sample_idx}_text",
+                    data=text,
+                    step=self.step_count
+                )
+
+        except Exception as e:
+            print(f"⚠️ Failed to log sample {sample_idx} to TensorBoard: {e}")
+
 
 class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
     """
@@ -1389,6 +1473,9 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                     audio_waveform = self._text_to_audio(text)
 
                     if audio_waveform is not None:
+                        # Ensure audio is float32 for TensorBoard logging
+                        audio_waveform = tf.cast(audio_waveform, tf.float32)
+
                         # Log audio to TensorBoard
                         tf.summary.audio(
                             name=f"sample_{i}_{text[:20].replace(' ', '_')}",
@@ -1416,12 +1503,30 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                     print(f"   ❌ Failed to log sample {i}: {e}")
 
     def _text_to_audio(self, text):
-        """Convert text to audio waveform."""
+        """Convert text to audio waveform with enhanced validation."""
         try:
-            # Tokenize
+            # Validate inputs
+            if not isinstance(text, str) or len(text.strip()) == 0:
+                print("   ⚠️ Invalid text input for audio generation")
+                return None
+
+            if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+                print("   ⚠️ Tokenizer not available")
+                return None
+
+            # Tokenize with validation
             tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+            if len(tokens) == 0:
+                print("   ⚠️ Tokenization produced empty sequence")
+                return None
+
             tokens = tokens[:256]  # Truncate
             input_ids = tf.constant([tokens], dtype=tf.int32)
+
+            # Validate input shape
+            if input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+                print(f"   ⚠️ Invalid input shape: {input_ids.shape}")
+                return None
 
             # Generate with proper mixed precision handling
             original_policy = tf.keras.mixed_precision.global_policy()
@@ -1436,15 +1541,34 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                     verbose=False
                 )
 
+                # Validate mel prediction
+                if mel_pred is None:
+                    print("   ⚠️ Model returned None mel prediction")
+                    return None
+
                 # Ensure float32
                 mel_pred = tf.cast(mel_pred, tf.float32)
+
+                # Validate mel shape
+                if mel_pred.shape[0] != 1 or mel_pred.shape[2] != audio_cfg.n_mels:
+                    print(f"   ⚠️ Invalid mel shape: {mel_pred.shape}")
+                    return None
 
             finally:
                 # Restore original policy
                 tf.keras.mixed_precision.set_global_policy(original_policy)
 
-            # Convert to audio
+            # Convert to audio with validation
             audio = self._mel_to_waveform(mel_pred.numpy()[0])
+            if audio is None:
+                print("   ⚠️ Waveform conversion failed")
+                return None
+
+            # Validate audio output
+            if audio.shape[0] != 1:
+                print(f"   ⚠️ Invalid audio shape: {audio.shape}")
+                return None
+
             return audio
 
         except Exception as e:
@@ -1452,13 +1576,38 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
             return None
 
     def _get_last_mel(self):
-        """Get the last generated mel-spectrogram."""
+        """Get the last generated mel-spectrogram with validation."""
         # This is a simplified version - in practice you'd store the last generated mel
         try:
+            # Validate sample texts
+            if not self.sample_texts or len(self.sample_texts) == 0:
+                print("   ⚠️ No sample texts available")
+                return None
+
             text = self.sample_texts[0]
+
+            # Validate text
+            if not isinstance(text, str) or len(text.strip()) == 0:
+                print("   ⚠️ Invalid sample text")
+                return None
+
+            # Validate tokenizer
+            if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+                print("   ⚠️ Tokenizer not available")
+                return None
+
             tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+            if len(tokens) == 0:
+                print("   ⚠️ Tokenization failed")
+                return None
+
             tokens = tokens[:256]
             input_ids = tf.constant([tokens], dtype=tf.int32)
+
+            # Validate input shape
+            if input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+                print(f"   ⚠️ Invalid input shape: {input_ids.shape}")
+                return None
 
             # Generate with proper mixed precision handling
             original_policy = tf.keras.mixed_precision.global_policy()
@@ -1473,7 +1622,17 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                     verbose=False
                 )
 
+                # Validate mel prediction
+                if mel_pred is None:
+                    print("   ⚠️ Model returned None mel prediction")
+                    return None
+
                 mel_pred = tf.cast(mel_pred, tf.float32)
+
+                # Validate shape
+                if mel_pred.shape[0] != 1 or mel_pred.shape[2] != audio_cfg.n_mels:
+                    print(f"   ⚠️ Invalid mel shape: {mel_pred.shape}")
+                    return None
 
             finally:
                 # Restore original policy
@@ -1481,21 +1640,48 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
 
             return mel_pred.numpy()[0]  # Remove batch dimension
 
-        except Exception:
+        except Exception as e:
+            print(f"   ⚠️ Failed to get last mel: {e}")
             return None
 
     def _mel_to_waveform(self, mel_norm):
-        """Convert normalized mel-spectrogram to audio waveform."""
+        """Convert normalized mel-spectrogram to audio waveform with validation."""
         try:
+            # Validate input
+            if mel_norm is None:
+                print("   ⚠️ Input mel is None")
+                return None
+
+            mel_norm = np.asarray(mel_norm)
+            if mel_norm.ndim != 2:
+                print(f"   ⚠️ Invalid mel dimensions: {mel_norm.shape}")
+                return None
+
+            if mel_norm.shape[1] != audio_cfg.n_mels:
+                print(f"   ⚠️ Invalid number of mel bins: {mel_norm.shape[1]}, expected {audio_cfg.n_mels}")
+                return None
+
             # Convert mel to linear spectrogram
             mel_power = self._denorm_mel(mel_norm)
+            if mel_power is None:
+                return None
+
             linear_power = self._mel_to_linear_power(mel_power)
+            if linear_power is None:
+                return None
 
             # Convert to magnitude
             mag = tf.sqrt(tf.maximum(linear_power, 1e-10))
 
             # Griffin-Lim reconstruction
             waveform = self._griffin_lim(mag.numpy())
+            if waveform is None:
+                return None
+
+            # Validate output
+            if waveform.shape[0] != 1:
+                print(f"   ⚠️ Invalid waveform batch dimension: {waveform.shape}")
+                return None
 
             return waveform
 
@@ -1505,30 +1691,78 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
 
     @staticmethod
     def _denorm_mel(mel_norm):
-        """Convert normalized mel [-1,1] to power scale."""
-        mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
-        mel_db = mel_01 * 100.0 - 100.0   # -> [-100, 0] dB
-        return tf.pow(10.0, mel_db / 10.0)  # -> power
+        """Convert normalized mel [-1,1] to power scale with validation."""
+        try:
+            if mel_norm is None:
+                return None
+
+            mel_norm = tf.convert_to_tensor(mel_norm, dtype=tf.float32)
+
+            # Validate range (should be approximately [-1, 1])
+            mel_min = tf.reduce_min(mel_norm)
+            mel_max = tf.reduce_max(mel_norm)
+
+            if mel_min < -1.5 or mel_max > 1.5:
+                print(f"   ⚠️ Mel values outside expected range: [{mel_min:.3f}, {mel_max:.3f}]")
+
+            mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
+            mel_01 = tf.clip_by_value(mel_01, 0.0, 1.0)  # Ensure valid range
+
+            mel_db = mel_01 * 100.0 - 100.0   # -> [-100, 0] dB
+            return tf.pow(10.0, mel_db / 10.0)  # -> power
+
+        except Exception as e:
+            print(f"   ⚠️ Mel denormalization failed: {e}")
+            return None
 
     def _mel_to_linear_power(self, mel_power):
-        """Convert mel power to linear power spectrogram."""
-        # Get mel filterbank (cached)
-        if not hasattr(self, '_mel_matrix'):
-            self._mel_matrix = tf.signal.linear_to_mel_weight_matrix(
-                num_mel_bins=audio_cfg.n_mels,
-                num_spectrogram_bins=audio_cfg.n_fft // 2 + 1,
-                sample_rate=audio_cfg.target_sample_rate,
-                lower_edge_hertz=audio_cfg.fmin,
-                upper_edge_hertz=audio_cfg.fmax,
-                dtype=tf.float32
-            )
+        """Convert mel power to linear power spectrogram with validation."""
+        try:
+            if mel_power is None:
+                return None
 
-        return tf.matmul(mel_power, tf.linalg.pinv(self._mel_matrix))
+            mel_power = tf.convert_to_tensor(mel_power, dtype=tf.float32)
+
+            # Validate mel power shape
+            if mel_power.ndim != 2:
+                print(f"   ⚠️ Invalid mel power dimensions: {mel_power.shape}")
+                return None
+
+            if mel_power.shape[1] != audio_cfg.n_mels:
+                print(f"   ⚠️ Invalid number of mel bins: {mel_power.shape[1]}, expected {audio_cfg.n_mels}")
+                return None
+
+            # Get mel filterbank (cached)
+            if not hasattr(self, '_mel_matrix'):
+                self._mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+                    num_mel_bins=audio_cfg.n_mels,
+                    num_spectrogram_bins=audio_cfg.n_fft // 2 + 1,
+                    sample_rate=audio_cfg.target_sample_rate,
+                    lower_edge_hertz=audio_cfg.fmin,
+                    upper_edge_hertz=audio_cfg.fmax,
+                    dtype=tf.float32
+                )
+
+            # Apply inverse mel filterbank
+            linear_power = tf.matmul(mel_power, tf.linalg.pinv(self._mel_matrix))
+
+            # Validate output shape
+            expected_bins = audio_cfg.n_fft // 2 + 1
+            if linear_power.shape[1] != expected_bins:
+                print(f"   ⚠️ Invalid linear power bins: {linear_power.shape[1]}, expected {expected_bins}")
+                return None
+
+            return linear_power
+
+        except Exception as e:
+            print(f"   ⚠️ Mel to linear conversion failed: {e}")
+            return None
 
     @staticmethod
     def _griffin_lim(mag, n_iter=30):
-        """Simple Griffin-Lim algorithm for phase reconstruction."""
-        mag = tf.cast(mag, tf.float32)  # Keep as float32, not complex64
+        """Simple Griffin-Lim algorithm for phase reconstruction with mixed precision fix."""
+        # Ensure mag is float32 to avoid mixed precision issues
+        mag = tf.cast(mag, tf.float32)
 
         # Random initial phase
         phase = tf.exp(1j * tf.random.uniform(tf.shape(mag), 0, 2*np.pi, dtype=tf.float32))
@@ -1551,7 +1785,7 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                 window_fn=tf.signal.hann_window
             )
 
-            # Update phase
+            # Update phase - ensure magnitude is applied correctly
             S = tf.cast(mag, tf.complex64) * tf.exp(1j * tf.angle(S))
 
         # Final ISTFT
@@ -1562,7 +1796,8 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
             window_fn=tf.signal.hann_window
         )
 
-        # Normalize
+        # Normalize and ensure float32 output
+        wav = tf.cast(wav, tf.float32)
         wav = wav / (tf.reduce_max(tf.abs(wav)) + 1e-6)
         return tf.expand_dims(wav, 0)  # Add batch dimension for TensorBoard
 
