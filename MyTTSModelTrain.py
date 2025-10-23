@@ -1,534 +1,828 @@
-# MyTTSModelTrain.py
 """
-Training script for MyTTSModel - Transformer-based Text-to-Speech
+MyTTSModel Training Script
 
-This module provides:
-- Data preprocessing and loading for TTS training
-- Custom training loop with masked losses
-- Guided Attention Loss (GAL) with ramp-up
-- Multiple metrics: L1 loss per mel-band, stop accuracy, within-epsilon-dB
-- EMA (Exponential Moving Average) of weights
-- Learning rate scheduling (Noam schedule)
-- Multi-GPU support via MirroredStrategy
-- Mixed precision training
+A comprehensive training pipeline for Transformer-based Text-to-Speech synthesis.
 
-The training uses:
-- NLLB tokenizer for multilingual text encoding
-- Mel-spectrogram preprocessing with caching
-- Teacher forcing with right-shifted decoder input
-- Dynamic stop token weighting based on class imbalance
+Features:
+- Multi-GPU training with MirroredStrategy
+- Mixed precision training for performance
+- Custom masked losses with dynamic weighting
+- Guided Attention Loss with gradual ramp-up
+- Exponential Moving Average (EMA) for model weights
+- Noam learning rate scheduling
+- Comprehensive metrics and monitoring
+
+Dependencies:
+- TensorFlow 2.x with mixed precision support
+- Transformers library for NLLB tokenizer
+- Custom TTSDataLoader for data preprocessing
 """
 
-import os, datetime, logging, warnings, tensorflow as tf, numpy as np
+import os
+import datetime
+import logging
+import warnings
+from dataclasses import dataclass
+import tensorflow as tf
+import numpy as np
 from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
-from TTSDataLoader import (AudioCfg, TextCfg, preprocess_dataset, TTSDataset)
+from TTSDataLoader import AudioCfg, TextCfg, preprocess_dataset, TTSDataset
 
-# GPU & logs
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-gpus = tf.config.list_physical_devices("GPU")
-for g in gpus:
+
+def setup_environment():
+    """Configure GPU memory growth and logging levels."""
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+    # Enable GPU memory growth
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
+
+    # Suppress verbose logging
+    import absl.logging
+    tf.get_logger().setLevel(logging.ERROR)
+    absl.logging.set_verbosity(absl.logging.ERROR)
+    warnings.filterwarnings("ignore")
+    hf_logging.set_verbosity_error()
+
+
+def setup_mixed_precision():
+    """Enable mixed precision training if available."""
     try:
-        tf.config.experimental.set_memory_growth(g, True)
+        from tensorflow.keras import mixed_precision
+        mixed_precision.set_global_policy("mixed_float16")
+        print("✅ Mixed precision enabled: float16 compute, float32 variables")
+        return True
+    except Exception as e:
+        print(f"⚠️ Mixed precision not available: {e}")
+        return False
+
+
+def setup_strategy():
+    """Initialize distributed training strategy."""
+    try:
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"✅ Using MirroredStrategy with {strategy.num_replicas_in_sync} GPUs")
+        return strategy
+    except Exception as e:
+        print(f"⚠️ MirroredStrategy unavailable, using default strategy: {e}")
+        return tf.distribute.get_strategy()
+
+
+# Initialize environment
+setup_environment()
+mixed_precision_enabled = setup_mixed_precision()
+strategy = setup_strategy()
+
+@dataclass
+class TrainingConfig:
+    """Configuration class for training parameters."""
+    # Dataset
+    dataset_root: str = "../dataset/dataset_train"
+    metadata_name: str = "metadata_train.csv"
+    language_code: str = "eng_Latn"
+
+    # Audio processing
+    audio_preset: str = "base16k"
+
+    # Training
+    batch_size: int = 4
+    epochs: int = 50
+    validation_split: float = 0.02
+
+    # Model
+    model_preset: str = "normal"
+    checkpoint_path: str = "checkpoints/tts_core_last.weights.h5"
+
+    # Optimization
+    learning_rate_warmup_steps: int = 4000
+    weight_decay: float = 1e-4
+    gradient_clip_norm: float = 1.0
+
+    # Losses
+    mel_pre_loss_weight: float = 0.5
+    mel_post_loss_weight: float = 1.0
+    stop_loss_weight: float = 0.5
+    guided_attention_weight: float = 0.2
+    guided_attention_sigma: float = 0.2
+
+    # EMA
+    ema_decay: float = 0.999
+
+    # Callbacks
+    early_stopping_patience: int = 8
+    guided_attention_ramp_epochs: int = 3
+
+    def __post_init__(self):
+        """Override defaults with environment variables."""
+        self.audio_preset = os.environ.get("TTS_AUDIO_PRESET", self.audio_preset)
+        self.model_preset = os.environ.get("TTS_MODEL_PRESET", self.model_preset)
+
+
+def load_tokenizer(language_code: str):
+    """Load and configure NLLB tokenizer."""
+    print(f"Loading NLLB tokenizer for language: {language_code}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        "facebook/nllb-200-distilled-600M",
+        use_fast=False,
+        src_lang=language_code
+    )
+    return tokenizer
+
+
+def setup_configs(tokenizer, config: TrainingConfig):
+    """Create audio and text configurations."""
+    from TTSConfig import make_audio_cfg, make_text_cfg
+
+    audio_cfg = make_audio_cfg(config.audio_preset)
+    text_cfg = make_text_cfg(tokenizer, config.language_code, max_text_len=256)
+
+    print(f"Audio config: preset={config.audio_preset}, "
+          f"sr={audio_cfg.target_sample_rate}, n_fft={audio_cfg.n_fft}, "
+          f"hop={audio_cfg.hop_length}, n_mels={audio_cfg.n_mels}, fmax={audio_cfg.fmax}")
+
+    return audio_cfg, text_cfg
+
+
+def preprocess_data(config: TrainingConfig, audio_cfg, text_cfg, tokenizer):
+    """Preprocess dataset with caching and parallel processing."""
+    print("🔄 Starting data preprocessing (tokenization + mel-spectrogram extraction)...")
+
+    # Setup caching
+    cache_dir = os.path.join("checkpoints", "mel_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Determine number of workers
+    num_workers = max(1, (os.cpu_count() or 2) - 1)
+
+    # Preprocess dataset
+    items, text_ids, mels, mel_lens = preprocess_dataset(
+        config.dataset_root, audio_cfg, text_cfg, tokenizer,
+        metadata_name=config.metadata_name,
+        num_workers=num_workers,
+        cache_dir=cache_dir,
+    )
+
+    # Log statistics
+    print(f"✅ Preprocessing complete:")
+    print(f"   - Total examples: {len(items)}")
+    print(f"   - Sample mel shape: {mels[0].shape if mels else 'N/A'}")
+    print(f"   - Sample text length: {len(text_ids[0]) if text_ids else 'N/A'}")
+
+    # Analyze tokenizer usage
+    if text_ids:
+        try:
+            max_token_id = max((max(seq) if len(seq) > 0 else 0) for seq in text_ids)
+            print(f"   - Tokenizer vocab size: {tokenizer.vocab_size}")
+            print(f"   - Max token ID in data: {max_token_id}")
+        except Exception as e:
+            print(f"   - Warning: Could not analyze token IDs: {e}")
+
+    return items, text_ids, mels, mel_lens
+
+
+# Initialize configuration
+config = TrainingConfig()
+tokenizer = load_tokenizer(config.language_code)
+audio_cfg, text_cfg = setup_configs(tokenizer, config)
+items, text_ids, mels, mel_lens = preprocess_data(config, audio_cfg, text_cfg, tokenizer)
+
+# Log training setup summary
+print("\n" + "="*60)
+print("🎯 TRAINING SETUP SUMMARY")
+print("="*60)
+print(f"📊 Dataset: {config.dataset_root}")
+print(f"🎵 Audio: {config.audio_preset} ({audio_cfg.target_sample_rate}Hz, {audio_cfg.n_mels} mels)")
+from TTSConfig import get_model_preset
+model_preset_info = get_model_preset(config.model_preset)
+print(f"🤖 Model: {config.model_preset} (layers={model_preset_info.num_layers})")
+print(f"📈 Batch size: {config.batch_size} (adjusted for {strategy.num_replicas_in_sync} GPUs)")
+print(f"🎯 Loss weights: mel_pre={config.mel_pre_loss_weight}, mel_post={config.mel_post_loss_weight}, stop={config.stop_loss_weight}")
+print(f"⏰ Training: {config.epochs} epochs")
+print(f"💾 Checkpoints: {config.checkpoint_path}")
+print(f"📊 Monitoring: Samples every 200 steps")
+print("="*60 + "\n")
+
+def create_data_split(config: TrainingConfig, items, text_ids, mels, mel_lens, strategy):
+    """Create train/validation split with proper batch size adjustment."""
+    print("🔄 Creating train/validation split...")
+
+    # Calculate sequence length statistics for padding optimization
+    text_lengths = np.array([len(seq) for seq in text_ids], dtype=np.int32)
+    mel_lengths = np.array(mel_lens, dtype=np.int32)
+
+    # Use 99th percentile for max lengths to handle outliers
+    max_src_len = int(min(256, max(8, np.percentile(text_lengths, 99) + 8)))
+    max_mel_len = int(min(2000, max(64, np.percentile(mel_lengths, 99) + 16)))
+    n_mels = audio_cfg.n_mels
+
+    print(f"   - Max source length: {max_src_len} (99th percentile)")
+    print(f"   - Max mel length: {max_mel_len} (99th percentile)")
+    print(f"   - Number of mel bins: {n_mels}")
+
+    # Create train/validation split
+    total_samples = len(items)
+    val_samples = max(1, int(total_samples * config.validation_split))
+
+    # Ensure at least one batch for training
+    if (total_samples - val_samples) < config.batch_size:
+        val_samples = max(1, total_samples - config.batch_size)
+
+    # Shuffle with fixed seed for reproducibility
+    indices = np.random.RandomState(42).permutation(total_samples)
+    train_indices = indices[:total_samples - val_samples]
+    val_indices = indices[total_samples - val_samples:]
+
+    # Split data
+    train_items = [items[i] for i in train_indices]
+    val_items = [items[i] for i in val_indices]
+    train_text_ids = [text_ids[i] for i in train_indices]
+    val_text_ids = [text_ids[i] for i in val_indices]
+    train_mels = [mels[i] for i in train_indices]
+    val_mels = [mels[i] for i in val_indices]
+    train_mel_lens = mel_lengths[train_indices]
+    val_mel_lens = mel_lengths[val_indices]
+
+    print(f"✅ Data split complete:")
+    print(f"   - Training samples: {len(train_items)}")
+    print(f"   - Validation samples: {len(val_items)}")
+
+    # Adjust batch size for distributed training
+    adjusted_batch_size = adjust_batch_size_for_strategy(config.batch_size, strategy)
+
+    return {
+        'train_items': train_items,
+        'val_items': val_items,
+        'train_text_ids': train_text_ids,
+        'val_text_ids': val_text_ids,
+        'train_mels': train_mels,
+        'val_mels': val_mels,
+        'train_mel_lens': train_mel_lens,
+        'val_mel_lens': val_mel_lens,
+        'max_src_len': max_src_len,
+        'max_mel_len': max_mel_len,
+        'n_mels': n_mels,
+        'batch_size': adjusted_batch_size
+    }
+
+
+def adjust_batch_size_for_strategy(batch_size: int, strategy) -> int:
+    """Adjust batch size to be divisible by number of replicas."""
+    try:
+        num_replicas = strategy.num_replicas_in_sync
+        if batch_size % max(1, num_replicas) != 0:
+            new_batch_size = num_replicas * ((batch_size + num_replicas - 1) // num_replicas)
+            print(f"🔧 Adjusting batch size {batch_size} -> {new_batch_size} for {num_replicas} replicas")
+            return new_batch_size
     except Exception:
         pass
-import absl.logging
-tf.get_logger().setLevel(logging.ERROR)
-absl.logging.set_verbosity(absl.logging.ERROR)
-warnings.filterwarnings("ignore")
-# Quiet transformers deprecation/info logs
-hf_logging.set_verbosity_error()
-
-# ---- Mixed precision (speeds up on modern GPUs) ----
-try:
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy("mixed_float16")
-    print("Using mixed precision: float16 compute, float32 vars")
-except Exception as _e:
-    print("Mixed precision not enabled:", _e)
-
-# ---- Multi-GPU strategy (MirroredStrategy) ----
-try:
-    strategy = tf.distribute.MirroredStrategy()
-    print(f"Using {strategy.num_replicas_in_sync} GPUs (MirroredStrategy)")
-except Exception as e:
-    print("MirroredStrategy unavailable, falling back to default. Reason:", e)
-    strategy = tf.distribute.get_strategy()
-
-# ---- Dataset configs
-ROOT = "../dataset/dataset_train"
-
-LANG_CODE = "eng_Latn"
-tok = AutoTokenizer.from_pretrained(
-    "facebook/nllb-200-distilled-600M", use_fast=False, src_lang=LANG_CODE
-)
-
-audio_cfg = AudioCfg(
-    sample_rate=16000, target_sample_rate=16000,
-    n_fft=1024, hop_length=256, win_length=1024,
-    n_mels=80, fmin=0.0, fmax=8000.0, trim_silence=False
-)
-text_cfg  = TextCfg(
-    pad_id=tok.pad_token_id,
-    bos_id=tok.bos_token_id,
-    eos_id=tok.eos_token_id,
-    max_text_len=256,
-    lang_code=LANG_CODE,
-)
+    return batch_size
 
 
+# Create data split
+data_split = create_data_split(config, items, text_ids, mels, mel_lens, strategy)
 
-print("Preprocessing (tokenize + wav→mel) ...")
-# فعال‌سازی کشِ مِل + پردازش موازی برای سرعت بهتر
-cache_dir = os.path.join("checkpoints", "mel_cache")
-os.makedirs(cache_dir, exist_ok=True)
-num_workers = max(1, (os.cpu_count() or 2) - 1)
-items, text_ids, mels, mel_lens = preprocess_dataset(
-    ROOT, audio_cfg, text_cfg, tok,
-    metadata_name="metadata_train.csv",
-    num_workers=num_workers,
-    cache_dir=cache_dir,
-)
-print("Examples:", len(items), " | First mel:", mels[0].shape, "| First text len:", len(text_ids[0]))
-try:
-    max_tok_id = int(max((max(t) if len(t)>0 else 0) for t in text_ids)) if len(text_ids)>0 else 0
-except Exception:
-    max_tok_id = 0
-print(f"Tokenizer size: vocab={tok.vocab_size} | len(tokenizer)={len(tok)} | max_id_in_data={max_tok_id}")
+def create_data_generators(data_split, text_cfg):
+    """Create training and validation data generators."""
+    print("🔄 Creating data generators...")
 
-# ---- Split train/val (بدون نشت)
-BATCH_SIZE   = 4
-# طول‌ها را بر اساس صدک‌ها تعیین کن تا پَدینگ کمتر شود
-text_lens = np.asarray([len(t) for t in text_ids], dtype=np.int32)
-mel_lens  = np.asarray(mel_lens, dtype=np.int32)
-MAX_SRC_LEN  = int(min(256, max(8, np.percentile(text_lens, 99) + 8)))
-MAX_MEL_LEN  = int(min(2000, max(64, np.percentile(mel_lens, 99) + 16)))
-N_MELS       = audio_cfg.n_mels
-
-N = len(items)
-val_ratio = 0.02
-# حداقل 1 نمونه برای val، و اطمینان از یک batch برای train
-n_val = max(1, int(N * val_ratio))
-if (N - n_val) < BATCH_SIZE:
-    n_val = max(1, N - BATCH_SIZE)
-perm = np.random.RandomState(42).permutation(N)
-tr_idx, va_idx = perm[: N - n_val], perm[N - n_val :]
-
-items_tr = [items[i] for i in tr_idx]
-items_va = [items[i] for i in va_idx]
-text_ids_tr = [text_ids[i] for i in tr_idx]
-text_ids_va = [text_ids[i] for i in va_idx]
-mels_tr = [mels[i] for i in tr_idx]
-mels_va = [mels[i] for i in va_idx]
-mel_lens_tr = mel_lens[tr_idx]
-mel_lens_va = mel_lens[va_idx]
-
-# اطمینان از سازگاری اندازه‌ی بچ با تعداد GPUها (global batch size)
-try:
-    num_repl = strategy.num_replicas_in_sync
-    if BATCH_SIZE % max(1, num_repl) != 0:
-        new_bs = num_repl * ((BATCH_SIZE + num_repl - 1) // num_repl)
-        print(f"Adjusting BATCH_SIZE {BATCH_SIZE} -> {new_bs} for {num_repl} replicas")
-        BATCH_SIZE = new_bs
-except Exception:
-    pass
-
-train_gen = TTSDataset(
-    text_ids_list=text_ids_tr,
-    mels_list=mels_tr,
-    batch_size=BATCH_SIZE,
-    pad_id=text_cfg.pad_id,
-    n_mels=N_MELS,
-    max_src_len=MAX_SRC_LEN,
-    max_mel_len=MAX_MEL_LEN,
-    shuffle=True
-)
-val_gen = TTSDataset(
-    text_ids_list=text_ids_va,
-    mels_list=mels_va,
-    batch_size=BATCH_SIZE,
-    pad_id=text_cfg.pad_id,
-    n_mels=N_MELS,
-    max_src_len=MAX_SRC_LEN,
-    max_mel_len=MAX_MEL_LEN,
-    shuffle=False
-)
-
-# ---- Model
-from MyTTSModel import TransformerTTS
-
-core_path = "checkpoints/tts_core_last.weights.h5"
-# مدل را با اندازه واژگان len(tokenizer) می‌سازیم تا added tokens را پوشش دهد
-NUM_LAYERS = 12
-D_MODEL = 512
-DFF = 2024
-NUM_HEADS = 8
-with strategy.scope():
-    model_core = TransformerTTS(
-        num_layers=NUM_LAYERS, d_model=D_MODEL, num_heads=NUM_HEADS, dff=DFF,
-        input_vocab_size=len(tok),
-        n_mels=N_MELS, dropout_rate=0.1, pad_id=text_cfg.pad_id,
-        use_prenet=True, prenet_drop=0.5
+    train_generator = TTSDataset(
+        text_ids_list=data_split['train_text_ids'],
+        mels_list=data_split['train_mels'],
+        batch_size=data_split['batch_size'],
+        pad_id=text_cfg.pad_id,
+        n_mels=data_split['n_mels'],
+        max_src_len=data_split['max_src_len'],
+        max_mel_len=data_split['max_mel_len'],
+        shuffle=True
     )
-    model_core.build_for_load(max_src_len=MAX_SRC_LEN, max_tgt_len=MAX_MEL_LEN)
-    if os.path.exists(core_path):
-        try:
-            model_core.load_weights(core_path)
-            print("✅ Weights loaded.")
-        except Exception as e:
-            print("⚠️ Failed to load weights strictly:", e)
-            try:
-                model_core.load_weights(core_path, skip_mismatch=True)
-                print("✅ Weights loaded with skip_mismatch.")
-            except Exception as e2:
-                print("⚠️ Skipped loading weights due to mismatch:", e2)
-    else:
-        print("⚠️ Checkpoint not found:", core_path)
 
-# ---- Learner (custom train/test step + ماسک)
-AUTO_SHIFT = False  # اگر دیتالودر dec_mel شیفت‌شده می‌دهد، False بماند
+    val_generator = TTSDataset(
+        text_ids_list=data_split['val_text_ids'],
+        mels_list=data_split['val_mels'],
+        batch_size=data_split['batch_size'],
+        pad_id=text_cfg.pad_id,
+        n_mels=data_split['n_mels'],
+        max_src_len=data_split['max_src_len'],
+        max_mel_len=data_split['max_mel_len'],
+        shuffle=False
+    )
+
+    print(f"✅ Data generators created:")
+    print(f"   - Training batches: {len(train_generator)}")
+    print(f"   - Validation batches: {len(val_generator)}")
+
+    return train_generator, val_generator
+
+
+# Create data generators
+train_generator, val_generator = create_data_generators(data_split, text_cfg)
+
+def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_cfg):
+    """Create and initialize the TTS model."""
+    print("🔄 Creating TTS model...")
+
+    from MyTTSModel import TransformerTTS
+    from TTSConfig import get_model_preset
+
+    # Get model configuration
+    model_config = get_model_preset(config.model_preset)
+    print(f"Model preset: {config.model_preset}")
+    print(f"   - Layers: {model_config.num_layers}")
+    print(f"   - Model dimension: {model_config.d_model}")
+    print(f"   - Attention heads: {model_config.num_heads}")
+    print(f"   - Feed-forward dimension: {model_config.dff}")
+    print(f"   - Dropout rate: {model_config.dropout_rate}")
+
+    with strategy.scope():
+        model = TransformerTTS(
+            num_layers=model_config.num_layers,
+            d_model=model_config.d_model,
+            num_heads=model_config.num_heads,
+            dff=model_config.dff,
+            input_vocab_size=len(tokenizer),
+            n_mels=data_split['n_mels'],
+            dropout_rate=model_config.dropout_rate,
+            pad_id=text_cfg.pad_id,
+            use_prenet=model_config.use_prenet,
+            prenet_drop=model_config.prenet_drop,
+            droppath_rate=model_config.droppath_rate,
+            cross_win=model_config.cross_win
+        )
+
+        # Build model with actual input shapes
+        model.build_for_load(
+            max_src_len=data_split['max_src_len'],
+            max_tgt_len=data_split['max_mel_len']
+        )
+
+        # Load weights if available
+        if os.path.exists(config.checkpoint_path):
+            success = load_model_weights(model, config.checkpoint_path)
+            if not success:
+                print("⚠️ Training will start from random initialization")
+        else:
+            print("ℹ️ No checkpoint found, starting from random initialization")
+
+    return model
+
+
+def load_model_weights(model, checkpoint_path: str) -> bool:
+    """Safely load model weights with fallback options."""
+    try:
+        model.load_weights(checkpoint_path)
+        print(f"✅ Successfully loaded weights from {checkpoint_path}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to load weights (strict mode): {e}")
+        try:
+            model.load_weights(checkpoint_path, skip_mismatch=True)
+            print(f"✅ Loaded weights with skip_mismatch from {checkpoint_path}")
+            return True
+        except Exception as e2:
+            print(f"❌ Failed to load weights (skip_mismatch): {e2}")
+            return False
+
+
+# Create model
+model = create_model(config, data_split, strategy, tokenizer, text_cfg)
 
 class TTSLearner(tf.keras.Model):
     """
     Custom training wrapper for TransformerTTS with masked losses and metrics.
-    
-    Implements custom train_step and test_step with:
-    - Masked L1 loss for mel-spectrogram (mean per band)
-    - Weighted binary cross-entropy for stop tokens with dynamic class weighting
+
+    This class implements custom training and validation steps with:
+    - Masked L1 loss for mel-spectrograms (computed per frequency band)
+    - Weighted binary cross-entropy for stop tokens with dynamic class balancing
     - Guided Attention Loss (GAL) with configurable weight and sigma
-    - Multiple training metrics including within-epsilon-dB accuracy
-    
+    - Comprehensive metrics including stop accuracy and dB error analysis
+
     Args:
-        core (TransformerTTS): The core TTS model.
-        loss_weights (dict, optional): Weights for different loss components.
-            Default: {"mel_pre": 0.5, "mel_post": 1.0, "stop": 0.5}.
+        model (TransformerTTS): The core TTS transformer model.
+        loss_weights (dict): Weights for different loss components.
         stop_pos_weight (float, optional): Positive class weight for stop BCE.
-            If None or <=0, computed dynamically from batch statistics.
-        ga_weight (float): Initial weight for Guided Attention Loss. Default: 0.2.
-        ga_sigma (float): Sigma parameter for GAL diagonal penalty. Default: 0.2.
-        
-    Attributes:
-        core (TransformerTTS): The wrapped TTS model.
-        ga_weight_var (tf.Variable): Current GAL weight (can be ramped during training).
-        train_loss, val_loss (tf.keras.metrics.Mean): Training and validation loss trackers.
-        mae_pre, mae_post (tf.keras.metrics.Mean): L1 loss trackers for pre/post mel.
-        bce_stop (tf.keras.metrics.Mean): BCE loss tracker for stop tokens.
-        stop_acc (tf.keras.metrics.BinaryAccuracy): Stop token prediction accuracy.
-        within2db (tf.keras.metrics.Mean): Percentage of mel bins within 2dB error.
-        ga_metric (tf.keras.metrics.Mean): Guided attention penalty tracker.
+            If None, computed dynamically from batch statistics.
+        guided_attention_weight (float): Initial weight for GAL.
+        guided_attention_sigma (float): Sigma parameter for GAL diagonal penalty.
     """
-    def __init__(self, core, loss_weights=None, stop_pos_weight=None, ga_weight=0.2, ga_sigma=0.2):
+
+    def __init__(self, model, loss_weights=None, stop_pos_weight=None,
+                 guided_attention_weight=0.2, guided_attention_sigma=0.2):
         super().__init__()
-        self.core = core
-        self.loss_weights = loss_weights or {"mel_pre": 0.5, "mel_post": 1.0, "stop": 0.5}
-        # None یا <=0 یعنی محاسبه پویا از نسبت کلاس‌ها در هر بچ
-        self.stop_pos_weight = None if (stop_pos_weight is None) else float(stop_pos_weight)
-        # Guided Attention
-        self.ga_weight = float(ga_weight)
-        self.ga_sigma = float(ga_sigma)
-        # وزن GAL به‌صورت متغیر تا در طول آموزش ramp شود
-        self.ga_weight_var = tf.Variable(self.ga_weight, trainable=False, dtype=tf.float32, name="ga_weight")
+        self.core = model
+        self.loss_weights = loss_weights or {
+            "mel_pre": 0.5,
+            "mel_post": 1.0,
+            "stop": 0.5
+        }
 
-        # Metrics
-        self.train_loss = tf.keras.metrics.Mean(name="loss")
-        self.val_loss   = tf.keras.metrics.Mean(name="val_loss")
-        self.mae_pre    = tf.keras.metrics.Mean(name="l1_pre")
-        self.mae_post   = tf.keras.metrics.Mean(name="l1_post")
-        self.bce_stop   = tf.keras.metrics.Mean(name="bce_stop")
-        self.stop_acc   = tf.keras.metrics.BinaryAccuracy(threshold=0.5, name="stop_acc")
-        self.within2db  = tf.keras.metrics.Mean(name="within2db")
-        self.ga_metric  = tf.keras.metrics.Mean(name="gal")
+        # Dynamic stop token weighting
+        self.stop_pos_weight = stop_pos_weight
 
-    # ---------- helpers ----------
-    @staticmethod
-    def _frame_mask_from_targets(targets):
-        """ماسک فریم برای لُس مل از خود تارگت مل (جلوگیری از حذف فریم پایان)"""
-        y = None
-        if isinstance(targets, dict):
-            if "mel_post" in targets:
-                y = targets["mel_post"]
-            elif "mel_pre" in targets:
-                y = targets["mel_pre"]
-        if y is None:
-            raise ValueError("targets must contain 'mel_post' or 'mel_pre' for mask building.")
-        mask_bt = tf.reduce_any(tf.math.abs(y) > 1e-6, axis=-1)   # (B,T) bool
-        return tf.cast(mask_bt[..., None], tf.float32)            # (B,T,1)
-
-    def _stop_mask(self, inputs, targets):
-        """ماسک stop مبتنی بر mel_len: فریم‌های [0..mel_len] در محاسبه لحاظ می‌شود.
-        یک فریم پس از پایان را نیز شامل می‌کنیم تا برچسب مثبت stop دیده شود."""
-        if not (isinstance(targets, dict) and "stop" in targets):
-            raise ValueError("targets must contain 'stop' for stop-mask.")
-        stop = tf.cast(targets["stop"], tf.float32)
-        T = tf.shape(stop)[1]
-        mel_len = None
-        if isinstance(inputs, dict) and ("mel_len" in inputs):
-            mel_len = tf.cast(inputs["mel_len"], tf.int32)
-        if mel_len is None:
-            if len(stop.shape) == 3 and stop.shape[-1] == 1:
-                stop = tf.squeeze(stop, -1)
-            return tf.ones_like(stop, dtype=tf.float32)
-        mask = tf.sequence_mask(mel_len + 1, maxlen=T, dtype=tf.float32)  # (B,T)
-        return mask
-
-    @staticmethod
-    def _masked_mae(y_true, y_pred, mask):
-        """
-        Compute masked mean absolute error.
-        
-        Args:
-            y_true (tf.Tensor): Ground truth values.
-            y_pred (tf.Tensor): Predicted values.
-            mask (tf.Tensor): Binary mask indicating valid positions.
-            
-        Returns:
-            tf.Tensor: Scalar MAE loss over valid positions.
-        """
-        mask = tf.cast(mask, y_pred.dtype)                        # (B,T,1) یا (B,T,80)
-        diff = tf.abs(y_pred - y_true)
-        num  = tf.reduce_sum(diff * mask)
-        den  = tf.reduce_sum(mask) + 1e-8
-        return num / den
-
-    @staticmethod
-    def _masked_mae_mean_per_band(y_true, y_pred, mask):
-        """میانگین L1 روی محور مل برای خواناییِ متریک، سپس ماسک فریم.
-        توجه: فقط برای متریک استفاده می‌شود؛ لُس اصلی تغییر نمی‌کند."""
-        mask = tf.cast(mask, y_pred.dtype)                        # (B,T,1) یا (B,T,80)
-        diff = tf.abs(y_pred - y_true)
-        diff = tf.reduce_mean(diff, axis=-1, keepdims=True)       # (B,T,1)
-        num  = tf.reduce_sum(diff * mask)
-        den  = tf.reduce_sum(mask) + 1e-8
-        return num / den
-
-    def _weighted_bce_logits(self, y_true, logits, stop_mask):
-        """
-        Compute weighted binary cross-entropy with dynamic positive class weighting.
-        
-        Automatically balances positive/negative classes by computing pos_weight
-        as the ratio of negative to positive samples in the batch.
-        
-        Args:
-            y_true (tf.Tensor): Ground truth stop labels of shape (B, T, 1) or (B, T).
-            logits (tf.Tensor): Predicted stop logits of shape (B, T, 1) or (B, T).
-            stop_mask (tf.Tensor): Binary mask of shape (B, T) indicating valid frames.
-            
-        Returns:
-            tf.Tensor: Scalar masked BCE loss.
-        """
-        # y_true: (B,T,1) | logits: (B,T,1) | stop_mask: (B,T)
-        y_true = tf.cast(y_true, tf.float32)
-        if len(y_true.shape) == 3 and y_true.shape[-1] == 1:
-            y_true = tf.squeeze(y_true, -1)                       # (B,T)
-        logits = tf.cast(logits, tf.float32)
-        if len(logits.shape) == 3 and logits.shape[-1] == 1:
-            logits = tf.squeeze(logits, -1)                       # (B,T)
-        stop_mask = tf.cast(stop_mask, tf.float32)                # (B,T)
-
-        # محاسبهٔ پویا: pos_weight = neg/pos روی فریم‌های ماسک‌شده
-        if (self.stop_pos_weight is None) or (self.stop_pos_weight <= 0.0):
-            pos = tf.reduce_sum(y_true * stop_mask) + 1e-8
-            neg = tf.reduce_sum((1.0 - y_true) * stop_mask) + 1e-8
-            pos_weight_val = neg / pos
-        else:
-            pos_weight_val = tf.constant(self.stop_pos_weight, dtype=tf.float32)
-
-        loss_el = tf.nn.weighted_cross_entropy_with_logits(
-            labels=y_true, logits=logits, pos_weight=pos_weight_val
-        )  # (B,T)
-        num = tf.reduce_sum(loss_el * stop_mask)
-        den = tf.reduce_sum(stop_mask) + 1e-8
-        return num / den
-
-    @staticmethod
-    def _within_eps_db(y_true, y_pred, frame_mask, eps=2.0):
-        """درصد بن‌های مِل که در بازه eps dB هستند، روی همه فریم‌های معتبر.
-        فقط برای متریک (بدون اثر روی آموزش)."""
-        # اطمینان از محدودهٔ ورودی‌ها برای تبدیل dB
-        x_t = tf.clip_by_value(tf.cast(y_true, tf.float32), -1.0, 1.0)
-        x_p = tf.clip_by_value(tf.cast(y_pred, tf.float32), -1.0, 1.0)
-        to_db = lambda x: ((x + 1.0) * 0.5) * 100.0 - 100.0
-        t_db = to_db(x_t)                       # (B,T,M)
-        p_db = to_db(x_p)                       # (B,T,M)
-        diff_db = tf.abs(p_db - t_db)           # (B,T,M)
-        # ماسک فریم‌ها و نرمال‌سازی بر تعداد بن‌ها
-        mask_bt1 = tf.cast(frame_mask, tf.float32)                  # (B,T,1)
-        good_btm = tf.cast(diff_db <= eps, tf.float32) * mask_bt1   # (B,T,M)
-        num = tf.reduce_sum(good_btm)
-        den = tf.reduce_sum(mask_bt1) * tf.cast(tf.shape(diff_db)[-1], tf.float32) + 1e-8
-        return num / den
-
-    def _assert_shift_ok(self, inputs, targets):
-        """
-        Sanity check that decoder input is properly right-shifted from targets.
-        
-        Verifies that dec_mel[:, 1:3] ≈ mel_target[:, 0:2] to ensure correct
-        teacher forcing setup.
-        
-        Args:
-            inputs (dict): Input dictionary containing 'dec_mel'.
-            targets (dict): Target dictionary containing 'mel_pre' or 'mel_post'.
-            
-        Raises:
-            tf.errors.InvalidArgumentError: If assertion fails.
-        """
-        # چک سبک: dec_mel باید شیفت y باشد (dec[:,1] ≈ y[:,0])
-        y_any = None
-        if isinstance(targets, dict):
-            if "mel_post" in targets:
-                y_any = targets["mel_post"]
-            elif "mel_pre" in targets:
-                y_any = targets["mel_pre"]
-        if y_any is None:
-            return
-        dec = inputs["dec_mel"]
-        dec_ = dec[:, 1:3, :]
-        y_   = y_any[:, 0:2, :]
-        tf.debugging.assert_near(
-            dec_, y_, atol=1e-3,
-            message="[assert] Decoder input must be right-shifted targets."
+        # Guided Attention Loss parameters
+        self.ga_weight = float(guided_attention_weight)
+        self.ga_sigma = float(guided_attention_sigma)
+        self.ga_weight_var = tf.Variable(
+            self.ga_weight,
+            trainable=False,
+            dtype=tf.float32,
+            name="ga_weight"
         )
 
-    # ---------- Guided Attention Terms ----------
-    def _guided_attn_terms(self, attn, enc_ids, mel_len, sigma=0.2):
+        # Training metrics
+        self.train_loss = tf.keras.metrics.Mean(name="loss")
+        self.val_loss = tf.keras.metrics.Mean(name="val_loss")
+        self.mae_pre = tf.keras.metrics.Mean(name="l1_pre")
+        self.mae_post = tf.keras.metrics.Mean(name="l1_post")
+        self.bce_stop = tf.keras.metrics.Mean(name="bce_stop")
+        self.stop_acc = tf.keras.metrics.BinaryAccuracy(threshold=0.5, name="stop_acc")
+        self.within2db = tf.keras.metrics.Mean(name="within2db")
+        self.ga_metric = tf.keras.metrics.Mean(name="gal")
+
+    # ---------- Helper Methods ----------
+    @staticmethod
+    def _create_frame_mask(targets):
         """
-        برمی‌گرداند:
-          - ga_loss: فرمول کلاسیک GAL نرمال‌شده روی T×S (کوچک است)
-          - ga_metric: میانگین پنالتی فقط روی زمان (B,T) → [0..1] برای نمایش بهتر
+        Create frame mask from mel targets to avoid penalizing padding regions.
+
+        The mask is True for frames that contain actual mel-spectrogram data
+        (where absolute values exceed a small threshold).
         """
-        if attn is None:
-            z = tf.constant(0.0, tf.float32)
-            return z, z
-        attn = tf.cast(attn, tf.float32)  # (B,T,S)
+        mel_target = targets.get("mel_post")
+        if mel_target is None:
+            mel_target = targets.get("mel_pre")
 
-        B = tf.shape(attn)[0]
-        T = tf.shape(attn)[1]
-        S = tf.shape(attn)[2]
+        if mel_target is None:
+            raise ValueError("Targets must contain 'mel_post' or 'mel_pre' for mask creation.")
 
-        # lengths
-        enc_valid = tf.not_equal(tf.cast(enc_ids, tf.int32), tf.cast(self.core.pad_id, tf.int32))  # (B,S)
-        enc_len = tf.reduce_sum(tf.cast(enc_valid, tf.int32), axis=1)  # (B,)
-        dec_len = tf.cast(mel_len, tf.int32)
+        # Create mask where frames have non-zero energy
+        valid_frames = tf.reduce_any(tf.abs(mel_target) > 1e-6, axis=-1)  # (B, T) boolean
+        return tf.cast(valid_frames[..., None], tf.float32)  # (B, T, 1)
 
-        # normalized coordinates
-        t_idx = tf.cast(tf.range(T)[None, :, None], tf.float32)  # (1,T,1)
-        s_idx = tf.cast(tf.range(S)[None, None, :], tf.float32)  # (1,1,S)
-        t_norm = t_idx / tf.maximum(tf.cast(dec_len[:, None, None], tf.float32) - 1.0, 1.0)  # (B,T,1)
-        s_norm = s_idx / tf.maximum(tf.cast(enc_len[:, None, None], tf.float32) - 1.0, 1.0)  # (B,1,S)
-        diff = t_norm - s_norm  # (B,T,S)
-        W = 1.0 - tf.exp(- (diff * diff) / (2.0 * (sigma ** 2)))  # (B,T,S)
+    def _create_stop_mask(self, inputs, targets):
+        """
+        Create mask for stop token loss based on actual mel sequence lengths.
 
-        # masks
-        dec_mask_bt = tf.sequence_mask(dec_len, maxlen=T, dtype=tf.float32)  # (B,T)
-        enc_mask_bs = tf.sequence_mask(enc_len, maxlen=S, dtype=tf.float32)  # (B,S)
-        mask_bts = dec_mask_bt[:, :, None] * enc_mask_bs[:, None, :]        # (B,T,S)
+        Includes one extra frame after the sequence ends to ensure the stop
+        token (positive label) is visible during training.
+        """
+        if not (isinstance(targets, dict) and "stop" in targets):
+            raise ValueError("Targets must contain 'stop' for stop mask creation.")
 
-        # classic GA loss normalized over T×S
-        num = tf.reduce_sum(W * attn * mask_bts)
-        den = tf.reduce_sum(mask_bts) + 1e-8
-        ga_loss = num / den
+        stop_targets = tf.cast(targets["stop"], tf.float32)
+        seq_length = tf.shape(stop_targets)[1]
 
-        # time-averaged metric: sum_s W*A in [0,1], average over valid T
-        attn_penalty_bt = tf.reduce_sum(W * attn, axis=-1)                  # (B,T)
-        num_m = tf.reduce_sum(attn_penalty_bt * dec_mask_bt)
-        den_m = tf.reduce_sum(dec_mask_bt) + 1e-8
-        ga_metric = num_m / den_m
+        # Get actual mel lengths from inputs
+        mel_lengths = None
+        if isinstance(inputs, dict) and "mel_len" in inputs:
+            mel_lengths = tf.cast(inputs["mel_len"], tf.int32)
+
+        if mel_lengths is None:
+            # Fallback: use all frames if lengths not available
+            if len(stop_targets.shape) == 3 and stop_targets.shape[-1] == 1:
+                stop_targets = tf.squeeze(stop_targets, -1)
+            return tf.ones_like(stop_targets, dtype=tf.float32)
+
+        # Mask includes frames up to mel_len + 1 for stop token visibility
+        return tf.sequence_mask(mel_lengths + 1, maxlen=seq_length, dtype=tf.float32)
+
+    @staticmethod
+    def _compute_masked_mae(y_true, y_pred, mask):
+        """
+        Compute masked Mean Absolute Error over valid positions.
+
+        Args:
+            y_true: Ground truth tensor
+            y_pred: Predicted tensor
+            mask: Binary mask tensor indicating valid positions
+
+        Returns:
+            Scalar MAE loss averaged over valid positions
+        """
+        mask = tf.cast(mask, y_pred.dtype)
+        absolute_errors = tf.abs(y_pred - y_true)
+        numerator = tf.reduce_sum(absolute_errors * mask)
+        denominator = tf.reduce_sum(mask) + 1e-8
+        return numerator / denominator
+
+    @staticmethod
+    def _compute_masked_mae_per_band(y_true, y_pred, mask):
+        """
+        Compute masked MAE averaged across mel frequency bands.
+
+        This provides a more interpretable metric by averaging across
+        frequency dimensions before applying the temporal mask.
+        """
+        mask = tf.cast(mask, y_pred.dtype)
+        absolute_errors = tf.abs(y_pred - y_true)
+        # Average across frequency bands (last dimension)
+        band_averaged_errors = tf.reduce_mean(absolute_errors, axis=-1, keepdims=True)
+        numerator = tf.reduce_sum(band_averaged_errors * mask)
+        denominator = tf.reduce_sum(mask) + 1e-8
+        return numerator / denominator
+
+    def _compute_weighted_bce_logits(self, y_true, logits, stop_mask):
+        """
+        Compute weighted binary cross-entropy with dynamic class balancing.
+
+        Automatically computes positive class weight as the ratio of negative
+        to positive samples in the batch to handle class imbalance in stop tokens.
+
+        Args:
+            y_true: Ground truth stop labels (B, T, 1) or (B, T)
+            logits: Predicted stop logits (B, T, 1) or (B, T)
+            stop_mask: Binary mask indicating valid frames (B, T)
+
+        Returns:
+            Scalar masked BCE loss
+        """
+        # Ensure proper tensor shapes
+        y_true = tf.cast(y_true, tf.float32)
+        if len(y_true.shape) == 3 and y_true.shape[-1] == 1:
+            y_true = tf.squeeze(y_true, -1)  # (B, T)
+
+        logits = tf.cast(logits, tf.float32)
+        if len(logits.shape) == 3 and logits.shape[-1] == 1:
+            logits = tf.squeeze(logits, -1)  # (B, T)
+
+        stop_mask = tf.cast(stop_mask, tf.float32)  # (B, T)
+
+        # Dynamic positive class weighting
+        if self.stop_pos_weight is None or self.stop_pos_weight <= 0.0:
+            # Compute class ratio from batch statistics
+            positive_samples = tf.reduce_sum(y_true * stop_mask) + 1e-6
+            negative_samples = tf.reduce_sum((1.0 - y_true) * stop_mask) + 1e-6
+            pos_weight = tf.clip_by_value(negative_samples / positive_samples, 1.0, 100.0)
+        else:
+            pos_weight = tf.constant(self.stop_pos_weight, dtype=tf.float32)
+
+        # Compute weighted cross-entropy
+        elementwise_loss = tf.nn.weighted_cross_entropy_with_logits(
+            labels=y_true, logits=logits, pos_weight=pos_weight
+        )  # (B, T)
+
+        # Apply mask and compute mean
+        masked_loss = elementwise_loss * stop_mask
+        numerator = tf.reduce_sum(masked_loss)
+        denominator = tf.reduce_sum(stop_mask) + 1e-8
+        return numerator / denominator
+
+    @staticmethod
+    def _compute_within_epsilon_db(y_true, y_pred, frame_mask, eps=2.0):
+        """
+        Compute percentage of mel bins within epsilon dB error.
+
+        This metric evaluates prediction accuracy in decibel space,
+        which is more perceptually relevant than linear amplitude space.
+
+        Args:
+            y_true: Ground truth mel-spectrogram
+            y_pred: Predicted mel-spectrogram
+            frame_mask: Binary mask for valid frames
+            eps: Error threshold in dB (default: 2.0)
+
+        Returns:
+            Percentage of bins within epsilon dB (0-1 range)
+        """
+        # Ensure inputs are in valid range for dB conversion
+        y_true_clipped = tf.clip_by_value(tf.cast(y_true, tf.float32), -1.0, 1.0)
+        y_pred_clipped = tf.clip_by_value(tf.cast(y_pred, tf.float32), -1.0, 1.0)
+
+        # Convert normalized mel to dB scale
+        def to_db_scale(x):
+            return ((x + 1.0) * 0.5) * 100.0 - 100.0
+
+        true_db = to_db_scale(y_true_clipped)  # (B, T, M)
+        pred_db = to_db_scale(y_pred_clipped)  # (B, T, M)
+
+        # Compute absolute dB difference
+        db_errors = tf.abs(pred_db - true_db)  # (B, T, M)
+
+        # Apply frame mask and count accurate predictions
+        frame_mask_float = tf.cast(frame_mask, tf.float32)  # (B, T, 1)
+        accurate_predictions = tf.cast(db_errors <= eps, tf.float32) * frame_mask_float  # (B, T, M)
+
+        # Compute percentage across all valid bins
+        total_accurate = tf.reduce_sum(accurate_predictions)
+        total_valid_frames = tf.reduce_sum(frame_mask_float)
+        num_mel_bins = tf.cast(tf.shape(db_errors)[-1], tf.float32)
+
+        return total_accurate / (total_valid_frames * num_mel_bins + 1e-8)
+
+    def _validate_teacher_forcing_shift(self, inputs, targets):
+        """
+        Validate that decoder inputs are properly right-shifted from targets.
+
+        This sanity check ensures teacher forcing is implemented correctly.
+        Only runs in eager mode to avoid graph compilation issues.
+        """
+        if not tf.executing_eagerly():
+            return
+
+        # Get target mel-spectrogram
+        target_mel = None
+        if isinstance(targets, dict):
+            target_mel = targets.get("mel_post") or targets.get("mel_pre")
+
+        if target_mel is None:
+            return
+
+        # Check decoder input alignment
+        decoder_input = inputs["dec_mel"]
+        decoder_slice = decoder_input[:, 1:3, :]  # Next 2 frames from decoder input
+        target_slice = target_mel[:, 0:2, :]      # First 2 frames from target
+
+        try:
+            tf.debugging.assert_near(
+                decoder_slice, target_slice, atol=1e-3,
+                message="Decoder input must be right-shifted targets for teacher forcing."
+            )
+        except tf.errors.InvalidArgumentError:
+            tf.print("⚠️ Warning: Decoder input not properly shifted for teacher forcing.")
+
+    def _compute_guided_attention_loss(self, attention_weights, encoder_ids, mel_lengths, sigma=0.2):
+        """
+        Compute Guided Attention Loss (GAL) to encourage diagonal attention patterns.
+
+        GAL penalizes attention weights that deviate from the diagonal, encouraging
+        monotonic alignment between source and target sequences.
+
+        Args:
+            attention_weights: Attention weights tensor (B, T, S)
+            encoder_ids: Encoder input token IDs (B, S)
+            mel_lengths: Target sequence lengths (B,)
+            sigma: Standard deviation for Gaussian penalty
+
+        Returns:
+            Tuple of (ga_loss, ga_metric) where:
+            - ga_loss: Normalized GAL for training
+            - ga_metric: Time-averaged penalty for monitoring
+        """
+        if attention_weights is None:
+            zero_tensor = tf.constant(0.0, tf.float32)
+            return zero_tensor, zero_tensor
+
+        attention_weights = tf.cast(attention_weights, tf.float32)  # (B, T, S)
+        batch_size, target_len, source_len = tf.shape(attention_weights)[0], tf.shape(attention_weights)[1], tf.shape(attention_weights)[2]
+
+        # Compute sequence lengths
+        encoder_mask = tf.not_equal(tf.cast(encoder_ids, tf.int32), tf.cast(self.core.pad_id, tf.int32))  # (B, S)
+        encoder_lengths = tf.reduce_sum(tf.cast(encoder_mask, tf.int32), axis=1)  # (B,)
+        decoder_lengths = tf.cast(mel_lengths, tf.int32)  # (B,)
+
+        # Create normalized coordinate grids
+        target_indices = tf.cast(tf.range(target_len)[None, :, None], tf.float32)  # (1, T, 1)
+        source_indices = tf.cast(tf.range(source_len)[None, None, :], tf.float32)  # (1, 1, S)
+
+        # Normalize by sequence lengths
+        target_norm = target_indices / tf.maximum(tf.cast(decoder_lengths[:, None, None], tf.float32) - 1.0, 1.0)  # (B, T, 1)
+        source_norm = source_indices / tf.maximum(tf.cast(encoder_lengths[:, None, None], tf.float32) - 1.0, 1.0)  # (B, 1, S)
+
+        # Compute Gaussian penalty matrix
+        coordinate_diff = target_norm - source_norm  # (B, T, S)
+        gaussian_penalty = 1.0 - tf.exp(-tf.square(coordinate_diff) / (2.0 * (sigma ** 2)))  # (B, T, S)
+
+        # Create validity masks
+        decoder_mask = tf.sequence_mask(decoder_lengths, maxlen=target_len, dtype=tf.float32)  # (B, T)
+        encoder_mask_float = tf.sequence_mask(encoder_lengths, maxlen=source_len, dtype=tf.float32)  # (B, S)
+        combined_mask = decoder_mask[:, :, None] * encoder_mask_float[:, None, :]  # (B, T, S)
+
+        # Compute normalized GAL
+        weighted_attention = gaussian_penalty * attention_weights * combined_mask
+        ga_loss = tf.reduce_sum(weighted_attention) / (tf.reduce_sum(combined_mask) + 1e-8)
+
+        # Compute time-averaged metric for monitoring
+        attention_penalty_per_frame = tf.reduce_sum(gaussian_penalty * attention_weights, axis=-1)  # (B, T)
+        ga_metric = tf.reduce_sum(attention_penalty_per_frame * decoder_mask) / (tf.reduce_sum(decoder_mask) + 1e-8)
+
         return ga_loss, ga_metric
 
     def call(self, inputs, training=False):
         """
-        Forward pass through the model.
-        
-        Args:
-            inputs (dict): Input dictionary with 'enc_ids', 'dec_mel', etc.
-            training (bool): Whether in training mode.
-            
-        Returns:
-            dict: Output dictionary with 'mel_pre', 'mel_post', 'stop', and 'attn' keys.
-        """
-        x = inputs
-        if training and AUTO_SHIFT:
-            x = dict(inputs)
-            x["dec_mel"] = self.core.shift_right_mel(inputs["dec_mel"], pad_val=0.0)
-        # درخواست attn در train/val برای GAL
-        if training:
-            outs = self.core(x, training=training, return_attn=True)
-            mel_pre, mel_post, stop_logits, attn = outs
-            return {"mel_pre": mel_pre, "mel_post": mel_post, "stop": stop_logits, "attn": attn}
-        else:
-            mel_pre, mel_post, stop_logits = self.core(x, training=training)
-            return {"mel_pre": mel_pre, "mel_post": mel_post, "stop": stop_logits, "attn": None}
+        Forward pass through the TTS model.
 
-    # ---------- train/test ----------
+        Args:
+            inputs: Dictionary containing 'enc_ids', 'dec_mel', 'mel_len', etc.
+            training: Whether in training mode (affects attention computation)
+
+        Returns:
+            Dictionary with model outputs: 'mel_pre', 'mel_post', 'stop', 'attn'
+        """
+        model_inputs = inputs
+
+        # Teacher forcing shift handled by data loader, not here
+        # Request attention weights during training for GAL computation
+        if training:
+            outputs = self.core(model_inputs, training=training, return_attn=True)
+            mel_pre, mel_post, stop_logits, attention = outputs
+            return {
+                "mel_pre": mel_pre,
+                "mel_post": mel_post,
+                "stop": stop_logits,
+                "attn": attention
+            }
+        else:
+            mel_pre, mel_post, stop_logits = self.core(model_inputs, training=training)
+            return {
+                "mel_pre": mel_pre,
+                "mel_post": mel_post,
+                "stop": stop_logits,
+                "attn": None
+            }
+
     def train_step(self, data):
         """
-        Custom training step with masked losses and guided attention.
-        
-        Computes:
-        - Masked L1 loss for mel_pre and mel_post (mean per mel-band)
-        - Weighted BCE for stop tokens with dynamic class balancing
-        - Guided Attention Loss with configurable weight
-        - Multiple metrics: stop accuracy, within-2dB accuracy, GAL penalty
-        
-        Args:
-            data (tuple): (inputs, targets) or (inputs, targets, sample_weights).
-            
-        Returns:
-            dict: Dictionary of metric names and values.
-        """
-        if len(data) == 3:
-            inputs, targets, _ = data
-        else:
-            inputs, targets = data
+        Custom training step implementing masked losses and guided attention.
 
-        self._assert_shift_ok(inputs, targets)
+        Computes and combines multiple loss terms:
+        - Masked L1 loss for mel-spectrograms (pre and post net)
+        - Weighted BCE for stop tokens with dynamic class balancing
+        - Guided Attention Loss for alignment regularization
+
+        Args:
+            data: Tuple of (inputs, targets) or (inputs, targets, sample_weights)
+
+        Returns:
+            Dictionary of training metrics
+        """
+        inputs, targets = data[0], data[1] if len(data) >= 2 else (data[0], data[1])
+
+        # Validate teacher forcing setup
+        self._validate_teacher_forcing_shift(inputs, targets)
 
         with tf.GradientTape() as tape:
             outputs = self(inputs, training=True)
 
-            # ماسک‌ها از تارگت (نه dec_mel)
-            frame_mask = self._frame_mask_from_targets(targets)   # (B,T,1)
-            stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
+            # Create masks from targets
+            frame_mask = self._create_frame_mask(targets)  # (B, T, 1)
+            stop_mask = self._create_stop_mask(inputs, targets)  # (B, T)
 
-            # --- Losses (ماسک‌دار)
-            # برای سازگاری با متریک‌ها، لُس را هم به میانگین هر باند تبدیل می‌کنیم
-            l1_pre_loss  = self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
-            l1_post_loss = self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
-            bce_stop= self._weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
+            # Compute masked losses
+            mel_pre_loss = self._compute_masked_mae_per_band(
+                targets["mel_pre"], outputs["mel_pre"], frame_mask
+            )
+            mel_post_loss = self._compute_masked_mae_per_band(
+                targets["mel_post"], outputs["mel_post"], frame_mask
+            )
+            stop_loss = self._compute_weighted_bce_logits(
+                targets["stop"], outputs["stop"], stop_mask
+            )
 
-            ga_loss, ga_vis = self._guided_attn_terms(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
-            loss = (
-                self.loss_weights["mel_pre"]  * l1_pre_loss +
-                self.loss_weights["mel_post"] * l1_post_loss +
-                self.loss_weights["stop"]     * bce_stop +
+            # Guided Attention Loss
+            ga_loss, ga_metric = self._compute_guided_attention_loss(
+                outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma
+            )
+
+            # Combine losses
+            total_loss = (
+                self.loss_weights["mel_pre"] * mel_pre_loss +
+                self.loss_weights["mel_post"] * mel_post_loss +
+                self.loss_weights["stop"] * stop_loss +
                 tf.cast(self.ga_weight_var, tf.float32) * ga_loss
             )
 
-        grads = tape.gradient(loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+        # Handle mixed precision gradient scaling
+        optimizer = self.optimizer
+        if hasattr(optimizer, "get_scaled_loss"):
+            scaled_loss = optimizer.get_scaled_loss(total_loss)
+        else:
+            scaled_loss = total_loss
 
-        # --- Metrics
-        self.train_loss.update_state(loss)
-        l1_pre_mean  = self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
-        l1_post_mean = self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
-        self.mae_pre.update_state(l1_pre_mean)
-        self.mae_post.update_state(l1_post_mean)
-        self.bce_stop.update_state(bce_stop)
-        self.ga_metric.update_state(ga_vis)
+        # Compute and process gradients
+        gradients = tape.gradient(scaled_loss, self.trainable_variables)
+        if hasattr(optimizer, "get_unscaled_gradients"):
+            gradients = optimizer.get_unscaled_gradients(gradients)
 
-        # BinaryAccuracy با ماسک stop
-        stop_prob   = tf.sigmoid(outputs["stop"])                                 # (B,T,1)
-        y_true_stop = tf.squeeze(tf.cast(targets["stop"], tf.float32), axis=-1)   # (B,T)
-        y_pred_stop = tf.squeeze(tf.cast(stop_prob > 0.5, tf.float32), axis=-1)   # (B,T)
-        self.stop_acc.update_state(y_true_stop, y_pred_stop, sample_weight=stop_mask)
+        # Clip gradients to prevent explosion
+        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
-        # within-ε
-        self.within2db.update_state(self._within_eps_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=2.0))
+        # Update metrics
+        self.train_loss.update_state(total_loss)
+        self.mae_pre.update_state(mel_pre_loss)
+        self.mae_post.update_state(mel_post_loss)
+        self.bce_stop.update_state(stop_loss)
+        self.ga_metric.update_state(ga_metric)
+
+        # Stop token accuracy with masking
+        stop_probabilities = tf.sigmoid(outputs["stop"])
+        true_stop_labels = tf.squeeze(tf.cast(targets["stop"], tf.float32), axis=-1)
+        predicted_stop_labels = tf.squeeze(tf.cast(stop_probabilities > 0.5, tf.float32), axis=-1)
+        self.stop_acc.update_state(true_stop_labels, predicted_stop_labels, sample_weight=stop_mask)
+
+        # Within-epsilon dB accuracy
+        self.within2db.update_state(
+            self._compute_within_epsilon_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=2.0)
+        )
 
         return {
             "loss": self.train_loss.result(),
-            "l1_pre": self.mae_pre.result(),   # میانگین هر باند
-            "l1_post": self.mae_post.result(), # میانگین هر باند
+            "l1_pre": self.mae_pre.result(),
+            "l1_post": self.mae_post.result(),
             "bce_stop": self.bce_stop.result(),
             "stop_acc": self.stop_acc.result(),
             "within2db": self.within2db.result(),
@@ -538,229 +832,824 @@ class TTSLearner(tf.keras.Model):
     def test_step(self, data):
         """
         Custom validation/test step with masked losses and metrics.
-        
-        Similar to train_step but runs model in eval mode and computes metrics
-        for monitoring validation performance.
-        
+
+        Similar to train_step but runs model in evaluation mode and computes
+        metrics for monitoring validation performance.
+
         Args:
-            data (tuple): (inputs, targets) or (inputs, targets, sample_weights).
-            
+            data: Tuple of (inputs, targets) or (inputs, targets, sample_weights)
+
         Returns:
-            dict: Dictionary of validation metric names and values.
+            Dictionary of validation metrics (Keras automatically adds 'val_' prefix)
         """
-        if len(data) == 3:
-            inputs, targets, _ = data
-        else:
-            inputs, targets = data
+        inputs, targets = data[0], data[1] if len(data) >= 2 else (data[0], data[1])
 
-        # Run core in eval mode but request attention for GA monitoring
-        mel_pre_core, mel_post_core, stop_logits_core, attn_core = self.core(inputs, training=False, return_attn=True)
-        outputs = {"mel_pre": mel_pre_core, "mel_post": mel_post_core, "stop": stop_logits_core, "attn": attn_core}
+        # Run model in eval mode but request attention for GAL monitoring
+        mel_pre_core, mel_post_core, stop_logits_core, attn_core = self.core(
+            inputs, training=False, return_attn=True
+        )
+        outputs = {
+            "mel_pre": mel_pre_core,
+            "mel_post": mel_post_core,
+            "stop": stop_logits_core,
+            "attn": attn_core
+        }
 
-        frame_mask = self._frame_mask_from_targets(targets)   # (B,T,1)
-        stop_mask  = self._stop_mask(inputs, targets)         # (B,T)
+        # Create masks
+        frame_mask = self._create_frame_mask(targets)
+        stop_mask = self._create_stop_mask(inputs, targets)
 
-        l1_pre_loss  = self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask)
-        l1_post_loss = self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
-        bce_stop= self._weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
+        # Compute losses
+        mel_pre_loss = self._compute_masked_mae_per_band(targets["mel_pre"], outputs["mel_pre"], frame_mask)
+        mel_post_loss = self._compute_masked_mae_per_band(targets["mel_post"], outputs["mel_post"], frame_mask)
+        stop_loss = self._compute_weighted_bce_logits(targets["stop"], outputs["stop"], stop_mask)
 
-        ga_loss, ga_vis = self._guided_attn_terms(outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma)
-        loss = (
-            self.loss_weights["mel_pre"]  * l1_pre_loss +
-            self.loss_weights["mel_post"] * l1_post_loss +
-            self.loss_weights["stop"]     * bce_stop +
+        # Guided Attention Loss
+        ga_loss, ga_metric = self._compute_guided_attention_loss(
+            outputs.get("attn"), inputs["enc_ids"], inputs["mel_len"], sigma=self.ga_sigma
+        )
+
+        # Combine losses
+        total_loss = (
+            self.loss_weights["mel_pre"] * mel_pre_loss +
+            self.loss_weights["mel_post"] * mel_post_loss +
+            self.loss_weights["stop"] * stop_loss +
             tf.cast(self.ga_weight_var, tf.float32) * ga_loss
         )
 
-        self.val_loss.update_state(loss)
+        self.val_loss.update_state(total_loss)
 
-        # stop accuracy (وزن‌دار)
-        stop_prob   = tf.sigmoid(outputs["stop"])
-        y_true_stop = tf.squeeze(tf.cast(targets["stop"], tf.float32), axis=-1)
-        y_pred_stop = tf.squeeze(tf.cast(stop_prob > 0.5, tf.float32), axis=-1)
-        correct = tf.cast(tf.equal(y_pred_stop, y_true_stop), tf.float32)
-        val_stop_acc = tf.reduce_sum(correct * stop_mask) / (tf.reduce_sum(stop_mask) + 1e-8)
+        # Stop token accuracy with masking
+        stop_probabilities = tf.sigmoid(outputs["stop"])
+        true_stop_labels = tf.squeeze(tf.cast(targets["stop"], tf.float32), axis=-1)
+        predicted_stop_labels = tf.squeeze(tf.cast(stop_probabilities > 0.5, tf.float32), axis=-1)
+        correct_predictions = tf.cast(tf.equal(predicted_stop_labels, true_stop_labels), tf.float32)
+        val_stop_accuracy = tf.reduce_sum(correct_predictions * stop_mask) / (tf.reduce_sum(stop_mask) + 1e-8)
 
-        # within-ε
-        val_within2db = self._within_eps_db(targets["mel_post"], outputs["mel_post"], frame_mask, eps=2.0)
+        # Within-epsilon dB accuracy
+        val_within_2db = self._compute_within_epsilon_db(
+            targets["mel_post"], outputs["mel_post"], frame_mask, eps=2.0
+        )
 
-        # کلیدها بدون پیشوند "val_" برگردند؛ Keras خودش val_ اضافه می‌کند
+        # Return metrics without 'val_' prefix (Keras adds it automatically)
         return {
             "loss": self.val_loss.result(),
-            "l1_pre": self._masked_mae_mean_per_band(targets["mel_pre"],  outputs["mel_pre"],  frame_mask),
-            "l1_post": self._masked_mae_mean_per_band(targets["mel_post"], outputs["mel_post"], frame_mask),
-            "bce_stop": bce_stop,
-            "stop_acc": val_stop_acc,
-            "within2db": val_within2db,
-            "gal": ga_vis,
+            "l1_pre": mel_pre_loss,
+            "l1_post": mel_post_loss,
+            "bce_stop": stop_loss,
+            "stop_acc": val_stop_accuracy,
+            "within2db": val_within_2db,
+            "gal": ga_metric,
         }
 
-# ---- Optimizer / LR schedule
-class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+def create_optimizer_and_learner(config: TrainingConfig, data_split, model, strategy):
+    """Create optimizer, learner, and compile the model."""
+    print("🔄 Setting up optimizer and learner...")
+
+    # Calculate steps per epoch for warmup scheduling
+    steps_per_epoch = max(1, len(train_generator))
+
+    with strategy.scope():
+        # Create learning rate schedule
+        lr_schedule = create_learning_rate_schedule(
+            config, data_split, steps_per_epoch
+        )
+
+        # Create optimizer with fallback for different TF versions
+        optimizer = create_optimizer(lr_schedule, config)
+
+        # Create learner model
+        learner = TTSLearner(
+            model,
+            loss_weights={
+                "mel_pre": config.mel_pre_loss_weight,
+                "mel_post": config.mel_post_loss_weight,
+                "stop": config.stop_loss_weight
+            },
+            stop_pos_weight=None,  # Dynamic weighting
+            guided_attention_weight=config.guided_attention_weight,
+            guided_attention_sigma=config.guided_attention_sigma,
+        )
+
+        # Compile with appropriate settings
+        run_eagerly = bool(int(os.environ.get("RUN_EAGERLY", "0")))
+        try:
+            learner.compile(
+                optimizer=optimizer,
+                run_eagerly=run_eagerly,
+                steps_per_execution=1  # Avoid XLA issues with MirroredStrategy
+            )
+        except TypeError:
+            learner.compile(optimizer=optimizer, run_eagerly=run_eagerly)
+
+    print("✅ Optimizer and learner setup complete")
+    return learner
+
+
+def create_learning_rate_schedule(config: TrainingConfig, data_split, steps_per_epoch):
+    """Create Noam learning rate schedule."""
+    from MyTTSModel import TransformerTTS
+    from TTSConfig import get_model_preset
+
+    model_config = get_model_preset(config.model_preset)
+    warmup_steps = max(1, 8 * steps_per_epoch)  # 8 epochs of warmup
+
+    return NoamLearningRateSchedule(
+        model_dimension=model_config.d_model,
+        warmup_steps=warmup_steps
+    )
+
+
+class NoamLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     """
     Noam learning rate schedule as used in "Attention is All You Need".
-    
+
     Implements warm-up followed by inverse square root decay:
     lr = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
-    
-    Args:
-        d_model (int): Model dimension, used for scaling the learning rate.
-        warmup_steps (int): Number of warmup steps. Default: 4000.
     """
-    
-    def __init__(self, d_model, warmup_steps=4000):
-        super().__init__(); self.d_model = tf.cast(d_model, tf.float32); self.warmup = float(max(1, warmup_steps))
-        
+
+    def __init__(self, model_dimension: int, warmup_steps: int = 4000):
+        super().__init__()
+        self.model_dimension = tf.cast(model_dimension, tf.float32)
+        self.warmup_steps = float(max(1, warmup_steps))
+
     def __call__(self, step):
-        """
-        Compute learning rate for given training step.
-        
-        Args:
-            step (int or tf.Tensor): Current training step.
-            
-        Returns:
-            tf.Tensor: Learning rate for this step.
-        """
         step = tf.cast(step, tf.float32)
-        warm = tf.maximum(tf.constant(self.warmup, tf.float32), tf.constant(1.0, tf.float32))
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(tf.math.rsqrt(step), step * (warm ** -1.5))
+        warmup_factor = tf.maximum(tf.constant(self.warmup_steps, tf.float32), 1.0)
 
-steps_per_epoch = max(1, len(train_gen))
-with strategy.scope():
-    optimizer = tf.keras.optimizers.Adam(
-        CustomSchedule(D_MODEL, warmup_steps=max(1, 8*steps_per_epoch)),
-        beta_1=0.9, beta_2=0.98, epsilon=1e-9, clipnorm=1.0
+        # Noam schedule formula
+        return (
+            tf.math.rsqrt(self.model_dimension) *
+            tf.math.minimum(
+                tf.math.rsqrt(step),
+                step * tf.math.pow(warmup_factor, -1.5)
+            )
+        )
+
+
+def create_optimizer(lr_schedule, config: TrainingConfig):
+    """Create AdamW optimizer with fallback for different TensorFlow versions."""
+    optimizer_kwargs = {
+        "learning_rate": lr_schedule,
+        "weight_decay": config.weight_decay,
+        "beta_1": 0.9,
+        "beta_2": 0.98,
+        "epsilon": 1e-9,
+        "clipnorm": config.gradient_clip_norm
+    }
+
+    # Try AdamW (TensorFlow 2.11+)
+    try:
+        return tf.keras.optimizers.AdamW(**optimizer_kwargs)
+    except AttributeError:
+        pass
+
+    # Try experimental AdamW (TensorFlow 2.10)
+    try:
+        from tensorflow.keras.optimizers.experimental import AdamW as AdamWExp
+        return AdamWExp(**optimizer_kwargs)
+    except ImportError:
+        pass
+
+    # Fallback to Adam
+    print("⚠️ AdamW not available, using Adam optimizer")
+    return tf.keras.optimizers.Adam(**optimizer_kwargs)
+
+
+# Create optimizer and learner
+learner = create_optimizer_and_learner(config, data_split, model, strategy)
+
+def create_callbacks(config: TrainingConfig):
+    """Create training callbacks for monitoring and checkpointing."""
+    print("🔄 Setting up training callbacks...")
+
+    # Enhanced TensorBoard logging with histograms and images
+    tensorboard = tf.keras.callbacks.TensorBoard(
+        log_dir=f"logs/tts/{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        update_freq='batch',
+        profile_batch=0,  # Disable profiling for performance
+        histogram_freq=1,  # Log histograms every epoch
+        write_graph=True,  # Log model graph
+        write_images=True,  # Log model weights as images
+        embeddings_freq=1   # Log embeddings
     )
 
-    learner = TTSLearner(
-        model_core,
-        loss_weights={"mel_pre": 0.5, "mel_post": 1.0, "stop": 0.5},
-        stop_pos_weight=None,
-        ga_weight=0.2,
-        ga_sigma=0.2,
+    # Early stopping
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=config.early_stopping_patience,
+        restore_best_weights=True,
+        verbose=1
     )
-    learner.compile(optimizer=optimizer, run_eagerly=False)
 
-# ---- Callbacks
-class EMAAndSaveCore(tf.keras.callbacks.Callback):
+    # Best model checkpoint
+    best_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        "checkpoints/tts_learner_best.weights.h5",
+        save_weights_only=True,
+        save_best_only=True,
+        monitor="val_loss",
+        mode="min",
+        verbose=1
+    )
+
+    # EMA and core model saving
+    ema_callback = ExponentialMovingAverageCallback(
+        decay=config.ema_decay,
+        core_path=config.checkpoint_path
+    )
+
+    # Guided Attention weight ramping
+    ga_ramp = GuidedAttentionRampCallback(
+        start=0.0,
+        target=config.guided_attention_weight,
+        ramp_epochs=config.guided_attention_ramp_epochs
+    )
+
+    callbacks = [ga_ramp, ema_callback, best_checkpoint, tensorboard, early_stopping]
+    print(f"✅ Created {len(callbacks)} callbacks")
+    return callbacks
+
+
+class ExponentialMovingAverageCallback(tf.keras.callbacks.Callback):
     """
     Callback to maintain Exponential Moving Average (EMA) of model weights.
-    
-    Tracks EMA of all trainable variables and saves both regular and EMA
-    checkpoints at the end of each epoch. EMA weights often provide better
-    generalization and smoother inference.
-    
-    Args:
-        decay (float): EMA decay rate. Default: 0.999.
-        core_path (str): Path to save regular model weights.
-            Default: "checkpoints/tts_core_last.weights.h5".
-            
-    Attributes:
-        ema_path (str): Path for EMA weights (derived from core_path).
+
+    EMA provides better generalization and smoother inference by maintaining
+    a running average of model weights during training.
     """
-    
-    def __init__(self, decay=0.999, core_path="checkpoints/tts_core_last.weights.h5"):
+
+    def __init__(self, decay: float = 0.999, core_path: str = "checkpoints/tts_core_last.weights.h5"):
         super().__init__()
         self.decay = float(decay)
-        self._pairs = None
         self.core_path = core_path
-        self.ema_path = "checkpoints/tts_core_ema_last.weights.h5"
+        self.ema_path = core_path.replace('.weights.h5', '_ema_last.weights.h5')
+        self._ema_pairs = None
 
     def on_train_begin(self, logs=None):
-        """
-        Initialize EMA shadow variables at the start of training.
-        
-        Args:
-            logs (dict, optional): Training logs.
-        """
-        core = self.model.core
-        pairs = []
-        for v in core.trainable_variables:
-            ema_v = tf.Variable(tf.zeros_like(v), trainable=False)
-            ema_v.assign(v)
-            pairs.append((ema_v, v))
-        self._pairs = pairs
+        """Initialize EMA shadow variables."""
+        core_model = self.model.core
+        ema_pairs = []
+        for variable in core_model.trainable_variables:
+            ema_variable = tf.Variable(
+                tf.zeros_like(variable),
+                trainable=False,
+                name=f"ema_{variable.name}"
+            )
+            ema_variable.assign(variable)
+            ema_pairs.append((ema_variable, variable))
+        self._ema_pairs = ema_pairs
 
     def on_train_batch_end(self, batch, logs=None):
-        if not self._pairs:
+        """Update EMA weights after each batch."""
+        if not self._ema_pairs:
             return
-        d = self.decay
-        for ema_v, v in self._pairs:
-            ema_v.assign(d * ema_v + (1.0 - d) * tf.cast(v, ema_v.dtype))
+
+        decay = self.decay
+        for ema_var, var in self._ema_pairs:
+            ema_var.assign(decay * ema_var + (1.0 - decay) * tf.cast(var, ema_var.dtype))
 
     def on_epoch_end(self, epoch, logs=None):
-        core = self.model.core
-        # Save regular core
-        core.save_weights(self.core_path)
-        msg = "\n[saved core → checkpoints/tts_core_last.weights.h5]"
-        # Save EMA snapshot by swapping weights temporarily
-        if self._pairs:
-            orig_vals = [tf.identity(v) for _, v in self._pairs]
-            for ema_v, v in self._pairs:
-                v.assign(tf.cast(ema_v, v.dtype))
-            core.save_weights(self.ema_path)
-            for (ema_v, v), val in zip(self._pairs, orig_vals):
-                v.assign(val)
-            msg += " | [ema saved → checkpoints/tts_core_ema_last.weights.h5]"
-        print(msg)
+        """Save model weights at epoch end."""
+        core_model = self.model.core
 
-tb   = tf.keras.callbacks.TensorBoard(
-    log_dir=f"logs/tts/{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}",
-    update_freq='batch'
-)
-early= tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True)
+        # Save regular weights
+        core_model.save_weights(self.core_path)
+        message = f"\n💾 Saved core weights → {self.core_path}"
 
-ckpt_learner = tf.keras.callbacks.ModelCheckpoint(
-    "checkpoints/tts_learner_best.weights.h5",
-    save_weights_only=True, save_best_only=True,
-    monitor="val_loss", mode="min", verbose=1
-)
+        # Save EMA weights
+        if self._ema_pairs:
+            original_values = [tf.identity(var) for _, var in self._ema_pairs]
+            for ema_var, var in self._ema_pairs:
+                var.assign(tf.cast(ema_var, var.dtype))
 
-class GAWeightRamp(tf.keras.callbacks.Callback):
+            core_model.save_weights(self.ema_path)
+            message += f" | EMA weights → {self.ema_path}"
+
+            # Restore original weights
+            for (_, var), original_val in zip(self._ema_pairs, original_values):
+                var.assign(original_val)
+
+        print(message)
+
+
+class GuidedAttentionRampCallback(tf.keras.callbacks.Callback):
     """
     Callback to gradually ramp up Guided Attention Loss weight during training.
-    
-    Linearly increases GAL weight from start value to target value over a
-    specified number of epochs. This helps stabilize early training before
-    enforcing strong attention alignment.
-    
-    Args:
-        start (float): Initial GAL weight. Default: 0.0.
-        target (float): Final GAL weight. Default: 0.2.
-        ramp_epochs (int): Number of epochs to ramp up. Default: 3.
+
+    Helps stabilize early training by starting with zero GAL weight and gradually
+    increasing it to encourage proper attention alignment.
     """
-    
-    def __init__(self, start=0.0, target=0.2, ramp_epochs=3):
+
+    def __init__(self, start: float = 0.0, target: float = 0.2, ramp_epochs: int = 3):
         super().__init__()
         self.start = float(start)
         self.target = float(target)
         self.ramp_epochs = int(ramp_epochs)
 
     def on_train_begin(self, logs=None):
-        """
-        Set initial GAL weight at the start of training.
-        
-        Args:
-            logs (dict, optional): Training logs.
-        """
+        """Set initial GAL weight."""
         try:
             self.model.ga_weight_var.assign(tf.cast(self.start, tf.float32))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Could not set initial GA weight: {e}")
 
     def on_epoch_begin(self, epoch, logs=None):
+        """Update GAL weight based on training progress."""
         if self.ramp_epochs <= 0:
-            w = self.target
+            weight = self.target
         else:
-            p = min(1.0, max(0.0, (epoch + 1) / float(self.ramp_epochs)))
-            w = self.start + (self.target - self.start) * p
+            progress = min(1.0, max(0.0, (epoch + 1) / float(self.ramp_epochs)))
+            weight = self.start + (self.target - self.start) * progress
+
         try:
-            self.model.ga_weight_var.assign(tf.cast(w, tf.float32))
+            self.model.ga_weight_var.assign(tf.cast(weight, tf.float32))
+            if epoch < self.ramp_epochs:
+                print(f"🎯 GAL weight: {weight:.4f} (ramping to {self.target:.4f})")
+        except Exception as e:
+            print(f"⚠️ Could not update GA weight: {e}")
+
+
+class SampleGenerationCallback(tf.keras.callbacks.Callback):
+    """
+    Callback to generate sample audio during training for progress monitoring.
+
+    Generates mel-spectrograms and audio samples at regular intervals to visually
+    and audibly track training progress. Saves samples to disk for later comparison.
+    """
+
+    def __init__(self, tokenizer, text_samples, generation_interval=200, max_samples_to_keep=5):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.text_samples = text_samples
+        self.generation_interval = generation_interval
+        self.max_samples_to_keep = max_samples_to_keep
+        self.samples_dir = "training_samples"
+        self.step_count = 0
+        os.makedirs(self.samples_dir, exist_ok=True)
+
+    def on_train_batch_end(self, batch, logs=None):
+        """Generate samples at specified intervals."""
+        self.step_count += 1
+
+        if self.step_count % self.generation_interval == 0:
+            try:
+                self._generate_samples()
+            except Exception as e:
+                print(f"⚠️ Sample generation failed: {e}")
+
+    def _generate_samples(self):
+        """Generate and save sample predictions."""
+        print(f"\n🎵 Generating samples at step {self.step_count}...")
+
+        # Clean up old samples
+        self._cleanup_old_samples()
+
+        for i, text in enumerate(self.text_samples):
+            try:
+                # Tokenize text
+                tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+                tokens = tokens[:256]  # Truncate if too long
+                input_ids = tf.constant([tokens], dtype=tf.int32)
+
+                # Generate mel-spectrogram with proper mixed precision handling
+                # Temporarily switch to float32 policy for inference
+                original_policy = tf.keras.mixed_precision.global_policy()
+                try:
+                    tf.keras.mixed_precision.set_global_policy('float32')
+
+                    mel_pred, stop_probs = self.model.core.greedy_generate_fast(
+                        input_ids,
+                        max_steps=600,
+                        min_steps=50,
+                        stop_threshold=0.8,
+                        verbose=False
+                    )
+
+                    # Ensure outputs are float32
+                    mel_pred = tf.cast(mel_pred, tf.float32)
+                    stop_probs = tf.cast(stop_probs, tf.float32)
+
+                finally:
+                    # Restore original policy
+                    tf.keras.mixed_precision.set_global_policy(original_policy)
+
+                # Save sample data
+                sample_data = {
+                    'text': text,
+                    'mel_shape': mel_pred.shape,
+                    'stop_probs_shape': stop_probs.shape,
+                    'step': self.step_count
+                }
+
+                # Save numpy arrays
+                np.savez_compressed(
+                    f"{self.samples_dir}/sample_{i}_step_{self.step_count}.npz",
+                    mel=mel_pred.numpy(),
+                    stop_probs=stop_probs.numpy(),
+                    metadata=str(sample_data)
+                )
+
+                print(f"   ✅ Sample {i}: '{text[:30]}...' → {mel_pred.shape[1]} frames")
+
+            except Exception as e:
+                print(f"   ❌ Sample {i} failed: {e}")
+
+        # Generate comparison plot
+        self._generate_comparison_plot()
+
+    def _cleanup_old_samples(self):
+        """Keep only the most recent samples."""
+        sample_files = sorted([
+            f for f in os.listdir(self.samples_dir)
+            if f.startswith("sample_") and f.endswith(".npz")
+        ], key=lambda x: os.path.getctime(os.path.join(self.samples_dir, x)))
+
+        if len(sample_files) > self.max_samples_to_keep * len(self.text_samples):
+            files_to_remove = sample_files[:len(sample_files) - self.max_samples_to_keep * len(self.text_samples)]
+            for f in files_to_remove:
+                try:
+                    os.remove(os.path.join(self.samples_dir, f))
+                except:
+                    pass
+
+    def _generate_comparison_plot(self):
+        """Generate a comparison plot of recent samples."""
+        try:
+            import matplotlib.pyplot as plt
+
+            # Find recent samples
+            sample_files = [
+                f for f in os.listdir(self.samples_dir)
+                if f.startswith("sample_0_") and f.endswith(".npz")
+            ]
+
+            if len(sample_files) < 2:
+                return
+
+            # Sort by step number
+            sample_files.sort(key=lambda x: int(x.split('_step_')[1].split('.')[0]))
+
+            # Load last few samples
+            recent_samples = sample_files[-3:]  # Show last 3 samples
+
+            plt.figure(figsize=(15, 4))
+
+            for i, fname in enumerate(recent_samples):
+                step_num = int(fname.split('_step_')[1].split('.')[0])
+                data = np.load(os.path.join(self.samples_dir, fname))
+
+                mel_db = self._mel_to_db(data['mel'][0])
+
+                plt.subplot(1, len(recent_samples), i+1)
+                plt.imshow(mel_db.T, origin='lower', aspect='auto', cmap='magma', vmin=-100, vmax=0)
+                plt.title(f'Step {step_num}')
+                plt.xlabel('Frames')
+                plt.ylabel('Mel bins')
+
+            plt.tight_layout()
+            plt.savefig(f"{self.samples_dir}/progress_step_{self.step_count}.png", dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"   📊 Progress plot saved to {self.samples_dir}/progress_step_{self.step_count}.png")
+
+        except ImportError:
+            print("   ⚠️ Matplotlib not available for plotting")
+        except Exception as e:
+            print(f"   ⚠️ Plot generation failed: {e}")
+
+    @staticmethod
+    def _mel_to_db(mel_norm):
+        """Convert normalized mel [-1,1] to dB [-100,0]."""
+        mel_norm = np.clip(mel_norm, -1.0, 1.0)
+        mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
+        return mel_01 * 100.0 - 100.0    # -> [-100, 0] dB
+
+
+class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
+    """
+    Callback to log generated audio samples to TensorBoard during training.
+
+    Generates audio waveforms from mel-spectrograms and logs them to TensorBoard
+    for real-time monitoring of training progress.
+    """
+
+    def __init__(self, tokenizer, sample_texts, log_interval=500, max_audio_samples=3):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.sample_texts = sample_texts[:max_audio_samples]  # Limit number of samples
+        self.log_interval = log_interval
+        self.max_audio_samples = max_audio_samples
+        self.step_count = 0
+        self.writer = None
+
+    def on_train_begin(self, logs=None):
+        """Initialize TensorBoard writer."""
+        try:
+            import tensorflow as tf
+            log_dir = f"logs/tts/audio_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            self.writer = tf.summary.create_file_writer(log_dir)
+            print(f"🎵 TensorBoard audio logging enabled: {log_dir}")
+        except Exception as e:
+            print(f"⚠️ TensorBoard audio logging failed to initialize: {e}")
+            self.writer = None
+
+    def on_train_batch_end(self, batch, logs=None):
+        """Generate and log audio samples at specified intervals."""
+        if self.writer is None:
+            return
+
+        self.step_count += 1
+
+        if self.step_count % self.log_interval == 0:
+            try:
+                self._generate_and_log_audio()
+            except Exception as e:
+                print(f"⚠️ Audio logging failed: {e}")
+
+    def _generate_and_log_audio(self):
+        """Generate audio samples and log to TensorBoard."""
+        if self.writer is None:
+            return
+
+        print(f"🎵 Logging audio samples to TensorBoard at step {self.step_count}...")
+
+        with self.writer.as_default():
+            for i, text in enumerate(self.sample_texts):
+                try:
+                    # Generate mel-spectrogram
+                    audio_waveform = self._text_to_audio(text)
+
+                    if audio_waveform is not None:
+                        # Log audio to TensorBoard
+                        tf.summary.audio(
+                            name=f"sample_{i}_{text[:20].replace(' ', '_')}",
+                            data=audio_waveform,
+                            sample_rate=audio_cfg.target_sample_rate,
+                            step=self.step_count,
+                            encoding='wav'
+                        )
+
+                        # Also log mel-spectrogram as image
+                        mel_spec = self._get_last_mel()
+                        if mel_spec is not None:
+                            # Convert to image format (add batch and channel dims)
+                            mel_image = tf.expand_dims(mel_spec, [0, -1])  # [1, T, M, 1]
+                            mel_image = tf.image.resize(mel_image, [128, 256])  # Resize for display
+                            tf.summary.image(
+                                name=f"mel_{i}_{text[:20].replace(' ', '_')}",
+                                data=mel_image,
+                                step=self.step_count
+                            )
+
+                        print(f"   ✅ Logged audio sample {i}: '{text[:30]}...'")
+
+                except Exception as e:
+                    print(f"   ❌ Failed to log sample {i}: {e}")
+
+    def _text_to_audio(self, text):
+        """Convert text to audio waveform."""
+        try:
+            # Tokenize
+            tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+            tokens = tokens[:256]  # Truncate
+            input_ids = tf.constant([tokens], dtype=tf.int32)
+
+            # Generate with proper mixed precision handling
+            original_policy = tf.keras.mixed_precision.global_policy()
+            try:
+                tf.keras.mixed_precision.set_global_policy('float32')
+
+                mel_pred, _ = self.model.core.greedy_generate_fast(
+                    input_ids,
+                    max_steps=600,
+                    min_steps=50,
+                    stop_threshold=0.8,
+                    verbose=False
+                )
+
+                # Ensure float32
+                mel_pred = tf.cast(mel_pred, tf.float32)
+
+            finally:
+                # Restore original policy
+                tf.keras.mixed_precision.set_global_policy(original_policy)
+
+            # Convert to audio
+            audio = self._mel_to_waveform(mel_pred.numpy()[0])
+            return audio
+
+        except Exception as e:
+            print(f"   ⚠️ Audio generation failed: {e}")
+            return None
+
+    def _get_last_mel(self):
+        """Get the last generated mel-spectrogram."""
+        # This is a simplified version - in practice you'd store the last generated mel
+        try:
+            text = self.sample_texts[0]
+            tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+            tokens = tokens[:256]
+            input_ids = tf.constant([tokens], dtype=tf.int32)
+
+            # Generate with proper mixed precision handling
+            original_policy = tf.keras.mixed_precision.global_policy()
+            try:
+                tf.keras.mixed_precision.set_global_policy('float32')
+
+                mel_pred, _ = self.model.core.greedy_generate_fast(
+                    input_ids,
+                    max_steps=600,
+                    min_steps=50,
+                    stop_threshold=0.8,
+                    verbose=False
+                )
+
+                mel_pred = tf.cast(mel_pred, tf.float32)
+
+            finally:
+                # Restore original policy
+                tf.keras.mixed_precision.set_global_policy(original_policy)
+
+            return mel_pred.numpy()[0]  # Remove batch dimension
+
         except Exception:
-            pass
+            return None
 
-callbacks = [GAWeightRamp(start=0.0, target=0.2, ramp_epochs=3), EMAAndSaveCore(decay=0.999, core_path=core_path), ckpt_learner, tb, early]
+    def _mel_to_waveform(self, mel_norm):
+        """Convert normalized mel-spectrogram to audio waveform."""
+        try:
+            # Convert mel to linear spectrogram
+            mel_power = self._denorm_mel(mel_norm)
+            linear_power = self._mel_to_linear_power(mel_power)
 
-print("Fitting ...")
-val_data = val_gen if len(val_gen) > 0 else None
-learner.fit(train_gen, validation_data=val_data, epochs=50, callbacks=callbacks)
+            # Convert to magnitude
+            mag = tf.sqrt(tf.maximum(linear_power, 1e-10))
+
+            # Griffin-Lim reconstruction
+            waveform = self._griffin_lim(mag.numpy())
+
+            return waveform
+
+        except Exception as e:
+            print(f"   ⚠️ Waveform conversion failed: {e}")
+            return None
+
+    @staticmethod
+    def _denorm_mel(mel_norm):
+        """Convert normalized mel [-1,1] to power scale."""
+        mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
+        mel_db = mel_01 * 100.0 - 100.0   # -> [-100, 0] dB
+        return tf.pow(10.0, mel_db / 10.0)  # -> power
+
+    def _mel_to_linear_power(self, mel_power):
+        """Convert mel power to linear power spectrogram."""
+        # Get mel filterbank (cached)
+        if not hasattr(self, '_mel_matrix'):
+            self._mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+                num_mel_bins=audio_cfg.n_mels,
+                num_spectrogram_bins=audio_cfg.n_fft // 2 + 1,
+                sample_rate=audio_cfg.target_sample_rate,
+                lower_edge_hertz=audio_cfg.fmin,
+                upper_edge_hertz=audio_cfg.fmax,
+                dtype=tf.float32
+            )
+
+        return tf.matmul(mel_power, tf.linalg.pinv(self._mel_matrix))
+
+    @staticmethod
+    def _griffin_lim(mag, n_iter=30):
+        """Simple Griffin-Lim algorithm for phase reconstruction."""
+        mag = tf.cast(mag, tf.complex64)
+
+        # Random initial phase
+        phase = tf.exp(1j * tf.random.uniform(tf.shape(mag), 0, 2*np.pi, dtype=tf.float32))
+        S = mag * phase
+
+        for _ in range(n_iter):
+            # ISTFT
+            wav = tf.signal.inverse_stft(
+                S,
+                frame_length=audio_cfg.win_length,
+                frame_step=audio_cfg.hop_length,
+                window_fn=tf.signal.hann_window
+            )
+
+            # STFT
+            S = tf.signal.stft(
+                wav,
+                frame_length=audio_cfg.win_length,
+                frame_step=audio_cfg.hop_length,
+                window_fn=tf.signal.hann_window
+            )
+
+            # Update phase
+            S = mag * tf.exp(1j * tf.angle(S))
+
+        # Final ISTFT
+        wav = tf.signal.inverse_stft(
+            S,
+            frame_length=audio_cfg.win_length,
+            frame_step=audio_cfg.hop_length,
+            window_fn=tf.signal.hann_window
+        )
+
+        # Normalize
+        wav = wav / (tf.reduce_max(tf.abs(wav)) + 1e-6)
+        return tf.expand_dims(wav, 0)  # Add batch dimension for TensorBoard
+
+
+class TrainingProgressLogger(tf.keras.callbacks.Callback):
+    """
+    Callback to log detailed training progress and metrics.
+
+    Provides real-time feedback on training progress, including loss values,
+    learning rate, and time estimates.
+    """
+
+    def __init__(self, log_interval=50):
+        super().__init__()
+        self.log_interval = log_interval
+        self.start_time = None
+        self.epoch_start_time = None
+
+    def on_train_begin(self, logs=None):
+        """Initialize training start time."""
+        self.start_time = tf.timestamp()
+        print("🏁 Training started...")
+
+    def on_epoch_begin(self, epoch, logs=None):
+        """Record epoch start time."""
+        self.epoch_start_time = tf.timestamp()
+        print(f"\n📅 Epoch {epoch + 1}/{self.model._train_counter if hasattr(self.model, '_train_counter') else 'N'}")
+
+    def on_train_batch_end(self, batch, logs=None):
+        """Log progress at specified intervals."""
+        if batch % self.log_interval == 0 and logs:
+            current_time = tf.timestamp()
+            elapsed = current_time - self.start_time
+
+            # Format metrics
+            loss = logs.get('loss', 0)
+            l1_pre = logs.get('l1_pre', 0)
+            l1_post = logs.get('l1_post', 0)
+            stop_acc = logs.get('stop_acc', 0)
+            within_2db = logs.get('within2db', 0)
+            gal = logs.get('gal', 0)
+
+            print(f"🔄 Step {batch:4d} | Loss: {loss:.4f} | L1_pre: {l1_pre:.4f} | L1_post: {l1_post:.4f} | "
+                  f"Stop_acc: {stop_acc:.3f} | Within_2dB: {within_2db:.3f} | GAL: {gal:.4f} | "
+                  f"Time: {elapsed/3600:.1f}h")
+
+    def on_epoch_end(self, epoch, logs=None):
+        """Log epoch completion with validation metrics."""
+        if logs:
+            train_loss = logs.get('loss', 0)
+            val_loss = logs.get('val_loss', 0)
+            val_l1_pre = logs.get('val_l1_pre', 0)
+            val_l1_post = logs.get('val_l1_post', 0)
+            val_stop_acc = logs.get('val_stop_acc', 0)
+            val_within_2db = logs.get('val_within2db', 0)
+
+            epoch_time = tf.timestamp() - self.epoch_start_time
+            print(f"✅ Epoch {epoch + 1} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                  f"Val L1_pre: {val_l1_pre:.4f} | Val L1_post: {val_l1_post:.4f} | "
+                  f"Val Stop_acc: {val_stop_acc:.3f} | Val Within_2dB: {val_within_2db:.3f} | "
+                  f"Duration: {epoch_time:.1f}s")
+
+
+# Create callbacks
+callbacks = create_callbacks(config)
+
+# Fix mixed precision for sample generation
+sample_generation_callback = SampleGenerationCallback(
+    tokenizer=tokenizer,
+    text_samples=["Hello world", "This is a test of the text to speech system"],
+    generation_interval=200,  # Generate samples every 200 steps
+    max_samples_to_keep=5
+)
+callbacks.append(sample_generation_callback)
+
+# Add training progress logger
+progress_logger = TrainingProgressLogger(log_interval=50)
+callbacks.append(progress_logger)
+
+# Enable TensorBoard audio logging with fixed mixed precision
+tensorboard_audio_callback = TensorBoardAudioLogger(
+    tokenizer=tokenizer,
+    sample_texts=["Hello world", "This is a test"],
+    log_interval=500,  # Log audio every 500 steps
+    max_audio_samples=3
+)
+callbacks.append(tensorboard_audio_callback)
+
+# Start training
+print("🚀 Starting training...")
+validation_data = val_generator if len(val_generator) > 0 else None
+learner.fit(
+    train_generator,
+    validation_data=validation_data,
+    epochs=config.epochs,
+    callbacks=callbacks
+)
+
+print("✅ Training completed!")

@@ -228,6 +228,7 @@ class DropPath(layers.Layer):
     def call(self, x, training=False):
         """
         Apply DropPath to input tensor.
+        Ensures dtype consistency under mixed precision by casting to x.dtype.
         
         Args:
             x (tf.Tensor): Input tensor.
@@ -238,9 +239,9 @@ class DropPath(layers.Layer):
         """
         if (not training) or self.drop_prob == 0.0:
             return x
-        keep_prob = 1.0 - self.drop_prob
+        keep_prob = tf.cast(1.0 - self.drop_prob, x.dtype)
         shape = (tf.shape(x)[0],) + (1,) * (len(x.shape) - 1)
-        random_tensor = keep_prob + tf.random.uniform(shape, 0, 1)
+        random_tensor = keep_prob + tf.random.uniform(shape, 0, 1, dtype=x.dtype)
         binary_tensor = tf.floor(random_tensor)
         return (x / keep_prob) * binary_tensor
 
@@ -684,13 +685,15 @@ class TransformerTTS(tf.keras.Model):
     def __init__(self, *, num_layers, d_model, num_heads, dff,
                  input_vocab_size, n_mels,
                  dropout_rate=0.1, pad_id=1, droppath_rate=0.0, max_length=4096,
-                 use_prenet=True, prenet_drop=0.5, name="TransformerTTS"):
+                 use_prenet=True, prenet_drop=0.5, cross_win=None, name="TransformerTTS"):
         super().__init__(name=name)
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         self.pad_id = int(pad_id)
         self.max_length = max_length
         self.n_mels = int(n_mels)
+        # عرض پنجرهٔ قطری برای cross-attention (0..1). None یعنی بدون محدودیت اضافی
+        self.cross_win = None if (cross_win is None) else float(cross_win)
 
         self.encoder = Encoder(num_layers=num_layers, d_model=d_model,
                                num_heads=num_heads, dff=dff,
@@ -798,13 +801,42 @@ class TransformerTTS(tf.keras.Model):
         else:
             raise ValueError("inputs must be (enc_ids, dec_mel) or a dict with keys enc_ids, dec_mel")
 
+        # جایگزینی فریم آغازین با go-frame برای پایداری بیشتر
+        B = tf.shape(dec_mel)[0]
+        go = tf.cast(tf.broadcast_to(self.go_frame, [B, 1, self.n_mels]), dec_mel.dtype)
+        dec_mel = tf.concat([go, dec_mel[:, 1:, :]], axis=1)
+
         enc_valid, enc_key_mask, dec_valid, dec_causal_key = self._build_masks(enc_ids, dec_mel, enc_len, mel_len)
 
         enc_out = self.encoder(enc_ids, key_mask=enc_key_mask, q_valid=enc_valid, training=training)
 
+        # اگر cross_win تنظیم شده باشد، ماسک قطری (B,T,S) برای cross-attention بساز
+        if self.cross_win is not None:
+            T = tf.shape(dec_mel)[1]
+            S = tf.shape(enc_ids)[1]
+            # طول‌ها
+            if enc_len is None:
+                enc_len_val = tf.reduce_sum(tf.cast(enc_valid, tf.int32), axis=1)
+            else:
+                enc_len_val = tf.cast(enc_len, tf.int32)
+            if mel_len is None:
+                dec_len_val = tf.reduce_sum(tf.cast(dec_valid, tf.int32), axis=1)
+            else:
+                dec_len_val = tf.cast(mel_len, tf.int32)
+
+            t_idx = tf.cast(tf.range(T)[None, :, None], tf.float32)  # (1,T,1)
+            s_idx = tf.cast(tf.range(S)[None, None, :], tf.float32)  # (1,1,S)
+            t_norm = t_idx / tf.maximum(tf.cast(dec_len_val[:, None, None], tf.float32) - 1.0, 1.0)
+            s_norm = s_idx / tf.maximum(tf.cast(enc_len_val[:, None, None], tf.float32) - 1.0, 1.0)
+            allow_diag = tf.abs(t_norm - s_norm) <= tf.cast(self.cross_win, tf.float32)  # (B,T,S)
+            enc_valid_b = enc_valid[:, None, :]  # (B,1,S)
+            enc_mask_for_cross = tf.logical_and(allow_diag, enc_valid_b)  # (B,T,S)
+        else:
+            enc_mask_for_cross = enc_key_mask
+
         dec_res = self.decoder(dec_mel, enc_out,
                                dec_causal_key_mask=dec_causal_key,
-                               enc_key_mask=enc_key_mask,
+                               enc_key_mask=enc_mask_for_cross,
                                q_valid=dec_valid,
                                training=training,
                                return_attn=return_attn)
@@ -846,9 +878,10 @@ class TransformerTTS(tf.keras.Model):
 
     # -------- greedy inference (go-frame) --------
     def greedy_generate_fast(self, enc_ids, *,
-                             max_steps=600, min_steps=40,
-                             stop_threshold=0.6, window=5, patience=3,
-                             check_stop_every=10, verbose=True):
+                             max_steps=600, min_steps=120,
+                             stop_threshold=0.9, window=8, patience=4,
+                             check_stop_every=5, verbose=True,
+                             use_postnet=True, return_pre=False):
         """
         Generate mel-spectrogram autoregressively using greedy decoding.
         
@@ -866,9 +899,9 @@ class TransformerTTS(tf.keras.Model):
             verbose (bool): Whether to print progress. Default: True.
             
         Returns:
-            tuple: (mel_post, stop_probs) where:
-                mel_post: Generated mel-spectrogram of shape (batch_size, gen_len, n_mels)
-                stop_probs: Stop probabilities of shape (batch_size, gen_len, 1)
+            tuple: If return_pre=False → (mel_hat, stop_probs)
+                   If return_pre=True  → (mel_pre, mel_hat, stop_probs)
+                   where mel_hat is postnet output if use_postnet=True, otherwise mel_pre.
         """
         B = tf.shape(enc_ids)[0]
 
@@ -917,6 +950,11 @@ class TransformerTTS(tf.keras.Model):
             mel_step = tf.concat([mel_step, mel_next_pre], axis=1)
 
         mel_pre  = tf.concat(mel_list, axis=1)  if mel_list  else tf.zeros([B, 0, self.n_mels], tf.float32)
-        mel_post = mel_pre + self.postnet(mel_pre, training=False)
+        if use_postnet:
+            mel_hat = mel_pre + self.postnet(mel_pre, training=False)
+        else:
+            mel_hat = mel_pre
         stop_probs = tf.concat(stop_list, axis=1) if stop_list else tf.zeros([B, 0, 1], tf.float32)
-        return mel_post, stop_probs
+        if return_pre:
+            return mel_pre, mel_hat, stop_probs
+        return mel_hat, stop_probs
