@@ -1379,7 +1379,8 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
             with self._summary_writer.as_default():
                 # Log mel-spectrogram as image
                 mel_db = self._mel_to_db(mel_pred.numpy()[0])  # Convert to dB for better visualization
-                mel_image = tf.expand_dims(mel_db, [0, -1])  # Add batch and channel dims
+                mel_image = tf.expand_dims(mel_db, axis=0)  # Add batch dim
+                mel_image = tf.expand_dims(mel_image, axis=-1)  # Add channel dim
                 mel_image = tf.image.resize(mel_image, [128, 256])  # Resize for display
 
                 tf.summary.image(
@@ -1489,7 +1490,8 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                         mel_spec = self._get_last_mel()
                         if mel_spec is not None:
                             # Convert to image format (add batch and channel dims)
-                            mel_image = tf.expand_dims(mel_spec, [0, -1])  # [1, T, M, 1]
+                            mel_image = tf.expand_dims(mel_spec, axis=0)  # Add batch dim [1, T, M]
+                            mel_image = tf.expand_dims(mel_image, axis=-1)  # Add channel dim [1, T, M, 1]
                             mel_image = tf.image.resize(mel_image, [128, 256])  # Resize for display
                             tf.summary.image(
                                 name=f"mel_{i}_{text[:20].replace(' ', '_')}",
