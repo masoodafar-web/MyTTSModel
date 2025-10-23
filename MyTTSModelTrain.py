@@ -1766,8 +1766,9 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
         # Ensure mag is float32 to avoid mixed precision issues
         mag = tf.cast(mag, tf.float32)
 
-        # Random initial phase
-        phase = tf.exp(1j * tf.random.uniform(tf.shape(mag), 0, 2*np.pi, dtype=tf.float32))
+        # Random initial phase (build complex tensor without Python 1j literals)
+        theta = tf.random.uniform(tf.shape(mag), 0.0, 2 * np.pi, dtype=tf.float32)
+        phase = tf.complex(tf.cos(theta), tf.sin(theta))
         S = tf.cast(mag, tf.complex64) * phase
 
         for _ in range(n_iter):
@@ -1787,8 +1788,10 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                 window_fn=tf.signal.hann_window
             )
 
-            # Update phase - ensure magnitude is applied correctly
-            S = tf.cast(mag, tf.complex64) * tf.exp(1j * tf.angle(S))
+            # Update phase - compute complex unit phase from angles without 1j
+            angles = tf.math.angle(S)
+            phase = tf.complex(tf.cos(angles), tf.sin(angles))
+            S = tf.cast(mag, tf.complex64) * phase
 
         # Final ISTFT
         wav = tf.signal.inverse_stft(
