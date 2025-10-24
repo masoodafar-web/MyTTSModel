@@ -35,6 +35,111 @@ class SinusoidalPositionalEncoding(layers.Layer):
         return input_shape
 
 
+class PhonemePairEmbedding(layers.Layer):
+    """
+    Separate embedding layer for phoneme pairs.
+    Processes each phoneme in a pair independently before combining.
+    """
+
+    def __init__(self, vocab_size, d_model, name=None):
+        super().__init__(name=name)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+
+        # Embedding for individual phonemes
+        self.phoneme_embedding = layers.Embedding(vocab_size, d_model // 2, name="phoneme_embed")
+
+        # Projection to combine pairs
+        self.pair_projection = layers.Dense(d_model, name="pair_proj")
+
+    def call(self, inputs):
+        # inputs: (B, S) - token IDs where each consecutive pair represents a phoneme pair
+        # For phoneme pairs: [BOS, p1, p2, p3, p4, ..., EOS]
+
+        # Reshape to process pairs: (B, S//2, 2) for pairs, handle odd lengths
+        seq_len = tf.shape(inputs)[1]
+        batch_size = tf.shape(inputs)[0]
+
+        # Ensure even length by padding if necessary
+        target_len = seq_len + (seq_len % 2)
+        if seq_len % 2 != 0:
+            # Pad with last token (usually EOS or padding)
+            padding = tf.fill([batch_size, 1], inputs[:, -1])
+            inputs = tf.concat([inputs, padding], axis=1)
+
+        # Reshape to pairs: (B, num_pairs, 2)
+        num_pairs = target_len // 2
+        pairs = tf.reshape(inputs, [batch_size, num_pairs, 2])
+
+        # Embed each phoneme in the pair
+        phoneme_embeds = self.phoneme_embedding(pairs)  # (B, num_pairs, 2, d_model//2)
+
+        # Combine phonemes in each pair (simple concatenation for now)
+        pair_combined = tf.reshape(phoneme_embeds, [batch_size, num_pairs, -1])  # (B, num_pairs, d_model)
+
+        # Project to final dimension
+        output = self.pair_projection(pair_combined)  # (B, num_pairs, d_model)
+
+        # Reshape back to sequence: (B, num_pairs * something, d_model)
+        # Since we combined pairs, output length is num_pairs
+        return output
+
+    def compute_output_shape(self, input_shape):
+        batch_size, seq_len = input_shape
+        num_pairs = (seq_len + 1) // 2  # Handle odd lengths
+        return (batch_size, num_pairs, self.d_model)
+
+
+class PhonemePairPositionalEncoding(layers.Layer):
+    """
+    Advanced positional encoding for phoneme pairs with separate encodings.
+    Each phoneme in a pair gets its own positional information.
+    """
+
+    def __init__(self, dim, max_period=10000, name=None):
+        super().__init__(name=name)
+        self.dim = dim
+        self.max_period = max_period
+        # Split dimension for phoneme and pair position
+        self.phoneme_dim = dim // 2
+        self.pair_dim = dim - self.phoneme_dim
+
+    def call(self, x):
+        # x: (B, S, d_model) - input tensor for positional encoding
+        seq_len = tf.shape(x)[1]
+        positions = tf.range(seq_len, dtype=tf.float32)  # (S,)
+
+        # Phoneme-level positions (within each pair)
+        phoneme_positions = positions % 2  # 0 for first phoneme, 1 for second
+
+        # Pair-level positions (across pairs)
+        pair_positions = positions // 2  # Pair index
+
+        # Phoneme encoding (within-pair position)
+        half_phoneme_dim = self.phoneme_dim // 2
+        phoneme_exponents = tf.range(half_phoneme_dim, dtype=tf.float32) / half_phoneme_dim
+        phoneme_freqs = tf.exp(-tf.math.log(float(self.max_period)) * phoneme_exponents)
+        phoneme_args = phoneme_positions[:, None] * phoneme_freqs[None, :]
+        phoneme_enc = tf.concat([tf.sin(phoneme_args), tf.cos(phoneme_args)], axis=-1)
+
+        # Pair encoding (across-pair position)
+        half_pair_dim = self.pair_dim // 2
+        pair_exponents = tf.range(half_pair_dim, dtype=tf.float32) / half_pair_dim
+        pair_freqs = tf.exp(-tf.math.log(float(self.max_period)) * pair_exponents)
+        pair_args = pair_positions[:, None] * pair_freqs[None, :]
+        pair_enc = tf.concat([tf.sin(pair_args), tf.cos(pair_args)], axis=-1)
+
+        # Combine encodings
+        pos_enc = tf.concat([phoneme_enc, pair_enc], axis=-1)
+        pos_enc = tf.expand_dims(pos_enc, axis=0)  # (1, S, dim)
+        pos_enc = tf.cast(pos_enc, x.dtype)  # Match input dtype
+
+        return x + pos_enc
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
 class SinusoidalTimestepEncoding(layers.Layer):
     """
     Sinusoidal encoding for diffusion timesteps.
@@ -49,6 +154,7 @@ class SinusoidalTimestepEncoding(layers.Layer):
     def call(self, timesteps):
         # timesteps: (B,) or scalar
         timesteps = tf.reshape(timesteps, [-1])
+        timesteps = tf.cast(timesteps, tf.float32)
         half_dim = self.dim // 2
         exponents = tf.range(half_dim, dtype=tf.float32) / tf.cast(half_dim, tf.float32)
         freqs = tf.exp(-tf.math.log(tf.cast(self.max_period, tf.float32)) * exponents)
@@ -280,44 +386,71 @@ class VoiceAutoencoder(tf.keras.Model):
         return reconstructed, latent
 
 
-class TortoiseDiffusionTTS(tf.keras.Model):
+class EncodecDiffusionTTS(tf.keras.Model):
     """
-    Tortoise-style TTS with diffusion model for mel generation.
+    Unified EncodecDiffusion TTS model.
+    Uses diffusion on discrete Encodec codes for high-quality text-to-speech.
     """
 
     def __init__(self, num_layers, d_model, num_heads, dff,
-                 input_vocab_size, n_mels, latent_dim=512,
-                 num_timesteps=1000, beta_start=1e-4, beta_end=0.02,
-                 name="TortoiseDiffusionTTS"):
+                 input_vocab_size, num_codebooks, codebook_size,
+                 latent_dim=512, num_timesteps=1000,
+                 beta_start=1e-4, beta_end=0.02,
+                 use_phoneme_pos_encoding=False,
+                 name="EncodecDiffusionTTS"):
         super().__init__(name=name)
-        self.n_mels = n_mels
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
         self.num_timesteps = num_timesteps
+        self.use_phoneme_pos_encoding = use_phoneme_pos_encoding
 
-        # Text encoder (simplified transformer encoder)
+        # Text encoder (transformer encoder)
         self.text_encoder = tf.keras.Sequential([
             layers.Embedding(input_vocab_size, d_model),
             layers.LayerNormalization(epsilon=1e-5),
-            *[tf.keras.Sequential([
-                layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads),
-                layers.LayerNormalization(epsilon=1e-5),
-                layers.Dense(dff, activation="gelu"),
-                layers.Dense(d_model),
-                layers.LayerNormalization(epsilon=1e-5),
-            ]) for _ in range(num_layers)],
         ], name="text_encoder")
 
-        # Voice autoencoder for conditioning
-        self.voice_autoencoder = VoiceAutoencoder(latent_dim=latent_dim, n_mels=n_mels)
+        # Add positional encoding to text encoder
+        if use_phoneme_pos_encoding:
+            self.text_pos_encoding = PhonemePairPositionalEncoding(d_model)
+        else:
+            self.text_pos_encoding = SinusoidalPositionalEncoding(d_model)
 
-        # RVQ for mel quantization
-        self.rvq = ResidualVectorQuantizer(
-            num_quantizers=4, num_embeddings=1024, embedding_dim=n_mels
+        # Freeze the large embedding block to avoid massive sparse optimizer updates
+        # that can trigger GPU OOM with very large vocabularies (e.g., ~256k for NLLB).
+        # You can unfreeze later once training stabilizes or switch to an embedding-aware optimizer.
+        self.text_encoder.trainable = False
+
+        # Separate transformer blocks
+        self.text_transformer_blocks = []
+        for _ in range(num_layers):
+            self.text_transformer_blocks.append(
+                TransformerBlock(d_model, num_heads, dff, dropout_rate=0.1)
+            )
+
+        # Voice conditioning encoder (lightweight):
+        # Use an embedding over code indices instead of flattening one-hot codes.
+        # This avoids an enormous Dense weight matrix of size (T*K*C) x hidden.
+        #
+        # voice_embedding: maps each code index in [0, C) to a small vector.
+        # We then average across time and codebooks and project to latent_dim.
+        voice_embed_dim = max(64, d_model // 4)
+        self.voice_embedding = layers.Embedding(
+            input_dim=codebook_size,
+            output_dim=voice_embed_dim,
+            name="voice_code_embedding",
         )
+        self.voice_proj = layers.Dense(latent_dim, activation="silu", name="voice_proj")
 
-        # Diffusion denoiser (U-Net based like Tortoise)
-        self.denoiser = DiffusionDenoiserUNet(
-            n_mels=n_mels, base_channels=d_model // 4,  # Adjust based on d_model
-            channel_mults=[1, 2, 4, 8], dropout_rate=0.1
+        # Diffusion denoiser for discrete codes
+        self.denoiser = DiscreteDiffusionDenoiser(
+            num_codebooks=num_codebooks,
+            codebook_size=codebook_size,
+            d_model=d_model,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dff=dff,
+            dropout_rate=0.1
         )
 
         # Diffusion schedule (DDPM)
@@ -327,196 +460,238 @@ class TortoiseDiffusionTTS(tf.keras.Model):
 
     def q_sample(self, x_0, t):
         """
-        Forward diffusion process: q(x_t | x_0)
+        Forward diffusion process for discrete codes: q(x_t | x_0)
+        Uses categorical diffusion (absorbing state diffusion).
         """
-        sqrt_alpha_cumprod = tf.sqrt(self.alpha_cumprod[t])
-        sqrt_one_minus_alpha_cumprod = tf.sqrt(1.0 - self.alpha_cumprod[t])
+        # For discrete codes, we use absorbing state diffusion
+        # x_0: (B, T, K) - one-hot encoded codes
+        # t: (B,) - timesteps
 
-        noise = tf.random.normal(tf.shape(x_0), dtype=x_0.dtype)
-        return sqrt_alpha_cumprod[:, None, None] * x_0 + sqrt_one_minus_alpha_cumprod[:, None, None] * noise, noise
+        # Probability of staying unchanged
+        # Gather schedule values for the batch timesteps
+        sqrt_alpha_cumprod = tf.sqrt(tf.gather(self.alpha_cumprod, t))  # (B,)
+        sqrt_alpha_cumprod = sqrt_alpha_cumprod[:, None, None, None]  # (B, 1, 1, 1)
+
+        # Probability of being absorbed (noise)
+        sqrt_one_minus_alpha_cumprod = tf.sqrt(1.0 - tf.gather(self.alpha_cumprod, t))  # (B,)
+        sqrt_one_minus_alpha_cumprod = sqrt_one_minus_alpha_cumprod[:, None, None, None]  # (B, 1, 1, 1)
+
+        # Create noise distribution (uniform over codebook)
+        B, T, K = tf.shape(x_0)[0], tf.shape(x_0)[1], tf.shape(x_0)[2]
+        noise_dist = tf.ones((B, T, K, self.codebook_size), dtype=tf.float32) / self.codebook_size  # (B, T, K, C)
+
+        # Mix clean and noise
+        x_t_logits = tf.math.log(sqrt_alpha_cumprod * tf.cast(x_0, tf.float32) +
+                                sqrt_one_minus_alpha_cumprod * noise_dist + 1e-8)
+
+        # Sample from the distribution
+        x_t = tf.random.categorical(tf.reshape(x_t_logits, (B*T*K, self.codebook_size)), num_samples=1)
+        x_t = tf.reshape(x_t, (B, T, K))
+        x_t_onehot = tf.one_hot(x_t, self.codebook_size, dtype=tf.float32)  # (B, T, K, C)
+
+        return x_t_onehot, x_0  # Return noisy codes and original for loss
 
     def p_sample(self, x_t, t, text_context, voice_latents, training=False):
         """
-        Reverse diffusion step: p(x_{t-1} | x_t)
+        Reverse diffusion step for discrete codes: p(x_{t-1} | x_t)
         """
-        predicted_noise = self.denoiser(x_t, t, text_context, voice_latents, training=training)
+        # Predict noise logits
+        predicted_logits = self.denoiser(x_t, t, text_context, voice_latents, training=training)
+        predicted_logits = tf.cast(predicted_logits, tf.float32)
 
-        alpha_t = self.alpha_schedule[t]
-        alpha_cumprod_t = self.alpha_cumprod[t]
-        beta_t = self.beta_schedule[t]
+        alpha_t = tf.gather(self.alpha_schedule, t)
+        alpha_cumprod_t = tf.gather(self.alpha_cumprod, t)
+        beta_t = tf.gather(self.beta_schedule, t)
 
-        sqrt_one_minus_alpha_cumprod_t = tf.sqrt(1.0 - alpha_cumprod_t)
-        sqrt_recip_alpha_t = 1.0 / tf.sqrt(alpha_t)
+        # Compute posterior logits
+        coef1 = (1.0 - alpha_cumprod_t) / tf.sqrt(1.0 - alpha_cumprod_t + 1e-8)
+        coef2 = alpha_t / tf.sqrt(1.0 - alpha_cumprod_t + 1e-8)
 
-        mean = sqrt_recip_alpha_t * (x_t - (beta_t / sqrt_one_minus_alpha_cumprod_t) * predicted_noise)
+        # Posterior mean
+        posterior_logits = coef1 * predicted_logits + coef2 * tf.math.log(tf.cast(x_t, tf.float32) + 1e-8)
 
-        if t[0] > 0:
-            noise = tf.random.normal(tf.shape(x_t), dtype=x_t.dtype)
-            variance = beta_t
-        else:
-            noise = tf.zeros_like(x_t)
-            variance = 0.0
+        # Sample from posterior
+        B, T, K = tf.shape(x_t)[0], tf.shape(x_t)[1], tf.shape(x_t)[2]
+        x_t_minus_1 = tf.random.categorical(
+            tf.reshape(posterior_logits, (B*T*K, self.codebook_size)), num_samples=1
+        )
+        x_t_minus_1 = tf.reshape(x_t_minus_1, (B, T, K))
+        x_t_minus_1_onehot = tf.one_hot(x_t_minus_1, self.codebook_size, dtype=tf.float32)
 
-        return mean + tf.sqrt(variance)[:, None, None] * noise
+        return x_t_minus_1_onehot
 
     def call(self, inputs, training=False):
         """
-        Training forward pass with diffusion.
+        Training forward pass with diffusion on codes.
         """
-        mel_target = inputs["mel"]  # (B, T, n_mels)
+        codes_target = inputs["codes"]  # (B, T, K) - integer codes
         text_ids = inputs["text_ids"]  # (B, S)
-        voice_mel = inputs.get("voice_mel", mel_target)  # For conditioning
+        voice_codes = inputs.get("voice_codes", codes_target)  # For conditioning
+
+        # Convert to one-hot
+        codes_onehot = tf.one_hot(codes_target, self.codebook_size, dtype=tf.float32)  # (B, T, K, C)
 
         # Encode text
-        text_context = self.text_encoder(text_ids, training=training)
+        text_emb = self.text_encoder(text_ids, training=training)
+        text_emb = self.text_pos_encoding(text_emb)
+        text_context = text_emb
+        for block in self.text_transformer_blocks:
+            text_context = block(text_context, training=training)
 
-        # Voice conditioning
-        _, voice_latents = self.voice_autoencoder(voice_mel, training=training)
-
-        # RVQ quantization for target
-        quantized_mel, rvq_indices, rvq_loss, rvq_perplexity = self.rvq(mel_target)
+        # Encode voice (efficiently via embeddings instead of one-hot -> huge Dense)
+        # voice_codes: (B, T, K) integer indices in [0, C)
+        v_emb = self.voice_embedding(voice_codes)  # (B, T, K, E)
+        v_mean = tf.reduce_mean(v_emb, axis=[1, 2])  # (B, E)
+        voice_latents = self.voice_proj(v_mean)  # (B, latent_dim)
 
         # Diffusion training
-        t = tf.random.uniform((tf.shape(mel_target)[0],), 0, self.num_timesteps, dtype=tf.int32)
-        noisy_mel, noise = self.q_sample(quantized_mel, t)
+        t = tf.random.uniform((tf.shape(codes_target)[0],), 0, self.num_timesteps, dtype=tf.int32)
+        noisy_codes, clean_codes = self.q_sample(codes_onehot, t)
 
         # Denoise
-        predicted_noise = self.denoiser(noisy_mel, t, text_context, voice_latents, training=training)
+        predicted_logits = self.denoiser(noisy_codes, t, text_context, voice_latents, training=training)
+        predicted_logits = tf.cast(predicted_logits, tf.float32)
 
-        # Diffusion loss
-        diffusion_loss = tf.reduce_mean((predicted_noise - noise)**2)
+        # Diffusion loss (cross-entropy)
+        diffusion_loss = tf.reduce_mean(
+            tf.nn.softmax_cross_entropy_with_logits(
+                labels=tf.stop_gradient(clean_codes),
+                logits=predicted_logits
+            )
+        )
 
-        return {
-            "diffusion_loss": diffusion_loss,
-            "rvq_loss": rvq_loss,
-            "rvq_perplexity": rvq_perplexity,
-            "total_loss": diffusion_loss + rvq_loss
-        }
+        return {"diffusion_loss": diffusion_loss}
 
-    def generate(self, text_ids, voice_mel, num_steps=50, guidance_scale=1.0):
+    def generate(self, text_ids, voice_codes=None, num_steps=50):
         """
-        Generate mel using diffusion sampling with optional classifier-free guidance.
+        Generate codes using diffusion sampling.
 
         Args:
             text_ids: Input text token IDs (B, S)
-            voice_mel: Reference voice mel for conditioning (B, T_ref, n_mels)
-            num_steps: Number of diffusion steps to use (fewer = faster but lower quality)
-            guidance_scale: Classifier-free guidance scale (1.0 = no guidance, >1.0 = more guidance)
+            voice_codes: Reference voice codes for conditioning (B, T_ref, K)
+            num_steps: Number of diffusion steps
 
         Returns:
-            Generated mel-spectrogram (B, T, n_mels)
+            Generated codes (B, T, K)
         """
         B = tf.shape(text_ids)[0]
-        T = 200  # Target mel length (can be adjusted)
+        if voice_codes is None:
+            # Use a minimal dummy reference: zeros indices
+            voice_codes = tf.zeros((B, 1, self.num_codebooks), dtype=tf.int32)
+        T = 200  # Target sequence length
 
-        # Encode text and voice
-        text_context = self.text_encoder(text_ids, training=False)
+        # Encode text
+        text_emb = self.text_encoder(text_ids, training=False)
+        text_emb = self.text_pos_encoding(text_emb)
+        text_context = text_emb
+        for block in self.text_transformer_blocks:
+            text_context = block(text_context, training=False)
+        text_context = tf.cast(text_context, tf.float32)
 
-        _, voice_latents = self.voice_autoencoder(voice_mel, training=False)
+        # Encode voice via embeddings
+        v_emb = self.voice_embedding(voice_codes)  # (B, T, K, E)
+        v_mean = tf.reduce_mean(v_emb, axis=[1, 2])  # (B, E)
+        voice_latents = self.voice_proj(v_mean)  # (B, latent_dim)
+        voice_latents = tf.cast(voice_latents, tf.float32)
 
-        # Start from noise
-        x_t = tf.random.normal((B, T, self.n_mels), dtype=tf.float32)
+        # Start from noise (uniform distribution)
+        x_t = tf.random.uniform((B, T, self.num_codebooks, self.codebook_size), 0.0, 1.0, dtype=tf.float32)
+        x_t = x_t / tf.reduce_sum(x_t, axis=-1, keepdims=True)  # Normalize to probabilities
 
-        # Reverse diffusion with optional guidance
+        # Reverse diffusion
         for t in reversed(range(0, self.num_timesteps, self.num_timesteps // num_steps)):
             t_tensor = tf.fill((B,), t)
+            x_t = self.p_sample(x_t, t_tensor, text_context, voice_latents, training=False)
 
-            if guidance_scale > 1.0:
-                # Classifier-free guidance: predict with and without conditioning
-                # For simplicity, we use unconditional prediction by zeroing text/voice
-                text_context_uncond = tf.zeros_like(text_context)
-                voice_latents_uncond = tf.zeros_like(voice_latents)
+        # Convert from one-hot to indices
+        generated_codes = tf.argmax(x_t, axis=-1)  # (B, T, K)
 
-                # Conditional prediction
-                x_t_cond = self.p_sample(x_t, t_tensor, text_context, voice_latents, training=False)
+        return generated_codes
 
-                # Unconditional prediction
-                x_t_uncond = self.p_sample(x_t, t_tensor, text_context_uncond, voice_latents_uncond, training=False)
+    def build_for_load(self, max_src_len, max_tgt_len):
+        """Build model by running a dummy forward pass."""
+        # Just run a dummy forward pass to build the model
+        enc_ids_in = tf.keras.Input(shape=(max_src_len,), dtype=tf.int32, name='enc_ids')
+        codes_in = tf.keras.Input(shape=(max_tgt_len, self.num_codebooks), dtype=tf.int32, name='codes')
 
-                # Apply guidance
-                x_t = x_t_uncond + guidance_scale * (x_t_cond - x_t_uncond)
-            else:
-                # Standard sampling without guidance
-                x_t = self.p_sample(x_t, t_tensor, text_context, voice_latents, training=False)
+        _ = self({
+            'text_ids': enc_ids_in,
+            'codes': codes_in,
+        }, training=False)
 
-        return x_t
+        self.built = True
+        print(f"✅ EncodecDiffusion model built with max_src_len={max_src_len}, max_tgt_len={max_tgt_len}")
 
-    def generate_with_encodec(self, text_ids, voice_mel, num_steps=50, guidance_scale=1.0):
+    
+
+
+class DiscreteDiffusionDenoiser(layers.Layer):
+    """
+    Diffusion denoiser for discrete codes (similar to U-Net but for categorical data).
+    """
+
+    def __init__(self, num_codebooks, codebook_size, d_model, num_layers, num_heads, dff, dropout_rate=0.1):
+        super().__init__()
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+
+        # Time embedding
+        self.time_embed = SinusoidalTimestepEncoding(d_model)
+        self.time_proj = layers.Dense(d_model, activation="silu")
+
+        # Code embedding (flatten K*C to single dimension)
+        self.code_embed = layers.Dense(d_model)
+
+        # Text conditioning
+        self.text_conditioning = layers.Dense(d_model)
+
+        # Voice conditioning
+        self.voice_conditioning = layers.Dense(d_model)
+
+        # Transformer blocks
+        self.transformer_blocks = [
+            TransformerBlock(d_model, num_heads, dff, dropout_rate)
+            for _ in range(num_layers)
+        ]
+
+        # Output projection
+        self.output_proj = layers.Dense(num_codebooks * codebook_size)
+
+    def call(self, codes_onehot, timesteps, text_context, voice_latents, training=False):
         """
-        Generate mel and convert to audio using Encodec for high-quality output.
-
-        Returns:
-            Generated audio waveform as tf.Tensor
+        Args:
+            codes_onehot: (B, T, K, C) - one-hot encoded noisy codes
+            timesteps: (B,) - diffusion timesteps
+            text_context: (B, S, D) - text encoder outputs
+            voice_latents: (B, L) - voice conditioning
         """
-        mel = self.generate(text_ids, voice_mel, num_steps, guidance_scale)
+        B, T, K, C = tf.shape(codes_onehot)[0], tf.shape(codes_onehot)[1], tf.shape(codes_onehot)[2], tf.shape(codes_onehot)[3]
 
-        # Convert mel to audio using Encodec for better quality than Griffin-Lim
-        try:
-            from codec.encodec_codec import Encodec24k
-            encodec = Encodec24k()
+        # Time embedding
+        t_emb = self.time_embed(timesteps)  # (B, d_model)
+        t_emb = self.time_proj(t_emb)  # (B, d_model)
 
-            # Convert normalized mel [-1,1] to audio
-            mel_norm = mel.numpy()[0]  # Remove batch dim, (T, n_mels)
+        # Flatten codes
+        codes_flat = tf.reshape(codes_onehot, (B, T, K * C))  # (B, T, K*C)
+        codes_emb = self.code_embed(codes_flat)  # (B, T, d_model)
 
-            # Denormalize mel to power scale
-            mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
-            mel_db = mel_01 * 100.0 - 100.0  # -> [-100, 0] dB
-            mel_power = tf.pow(10.0, mel_db / 10.0)  # -> power
+        # Add time embedding
+        codes_emb = codes_emb + t_emb[:, None, :]  # Broadcast time to sequence
 
-            # Convert to linear spectrogram
-            n_fft = 1024  # Should match audio config
-            n_mels = self.n_mels
-            mel_matrix = tf.signal.linear_to_mel_weight_matrix(
-                num_mel_bins=n_mels,
-                num_spectrogram_bins=n_fft // 2 + 1,
-                sample_rate=24000,  # Encodec 24kHz
-                lower_edge_hertz=0.0,
-                upper_edge_hertz=12000.0
-            )
-            linear_power = tf.matmul(mel_power, tf.linalg.pinv(mel_matrix))
+        # Add conditioning
+        text_cond = tf.reduce_mean(text_context, axis=1)  # (B, d_model)
+        voice_cond = self.voice_conditioning(voice_latents)  # (B, d_model)
+        codes_emb = codes_emb + text_cond[:, None, :] + voice_cond[:, None, :]
 
-            # Convert to magnitude
-            mag = tf.sqrt(tf.maximum(linear_power, 1e-10))
+        # Apply transformer blocks
+        for block in self.transformer_blocks:
+            codes_emb = block(codes_emb, training=training)
 
-            # Griffin-Lim for initial phase reconstruction
-            wav_gl = self._griffin_lim_simple(mag.numpy(), n_iter=16)
+        # Output logits
+        logits_flat = self.output_proj(codes_emb)  # (B, T, K*C)
+        logits = tf.reshape(logits_flat, (B, T, K, C))  # (B, T, K, C)
 
-            # Re-encode with Encodec for quality enhancement
-            audio_24k = encodec.reencode_to_24k(wav_gl, input_sr=24000)
-
-            return tf.convert_to_tensor(audio_24k, dtype=tf.float32)
-
-        except ImportError:
-            print("⚠️ Encodec not available, falling back to Griffin-Lim")
-            # Fallback to Griffin-Lim
-            from MyTTSModelTrain import TensorBoardAudioLogger
-            audio_logger = TensorBoardAudioLogger(None, [], use_encodec=False)
-            audio = audio_logger._mel_to_waveform(mel.numpy()[0])
-            return audio
-
-    @staticmethod
-    def _griffin_lim_simple(mag, n_iter=16):
-        """Simple Griffin-Lim for phase reconstruction."""
-        mag = tf.cast(mag, tf.float32)
-        theta = tf.random.uniform(tf.shape(mag), 0.0, 2 * np.pi, dtype=tf.float32)
-        phase = tf.complex(tf.cos(theta), tf.sin(theta))
-        S = mag * phase
-
-        for _ in range(n_iter):
-            wav = tf.signal.inverse_stft(
-                S, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
-            )
-            S = tf.signal.stft(
-                wav, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
-            )
-            angles = tf.math.angle(S)
-            phase = tf.complex(tf.cos(angles), tf.sin(angles))
-            S = mag * phase
-
-        wav_final = tf.signal.inverse_stft(
-            S, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
-        )
-        return tf.cast(wav_final, tf.float32)
+        return logits
 # =========================
 # Transformer TTS Model
 # =========================
@@ -540,7 +715,8 @@ class TransformerTTS(tf.keras.Model):
                  dropout_rate=0.1, pad_id=0, use_prenet=True, prenet_drop=0.5,
                  droppath_rate=0.0, cross_win=None, enable_postnet=True,
                  activation='gelu', pos_encoding_type='sinusoidal',
-                 target_type='mel', num_codebooks=None, codebook_size=None, **kwargs):
+                 target_type='mel', num_codebooks=None, codebook_size=None,
+                 use_phoneme_pos_encoding=False, **kwargs):
         super().__init__(**kwargs)
 
         self.pad_id = pad_id
@@ -548,6 +724,7 @@ class TransformerTTS(tf.keras.Model):
         self.target_type = target_type
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
+        self.use_phoneme_pos_encoding = use_phoneme_pos_encoding
 
         # Output dimensions based on target type
         if target_type == 'codes':
@@ -558,7 +735,10 @@ class TransformerTTS(tf.keras.Model):
         # Encoder
         self.encoder_embedding = layers.Embedding(input_vocab_size, d_model)
         if pos_encoding_type == 'sinusoidal':
-            self.encoder_pos_encoding = SinusoidalPositionalEncoding(d_model)
+            if use_phoneme_pos_encoding:
+                self.encoder_pos_encoding = PhonemePairPositionalEncoding(d_model)
+            else:
+                self.encoder_pos_encoding = SinusoidalPositionalEncoding(d_model)
         else:
             self.encoder_pos_encoding = LearnedPositionalEncoding(d_model)
 
@@ -580,6 +760,7 @@ class TransformerTTS(tf.keras.Model):
         # Decoder
         self.decoder_embedding = LinearEmbedding(self.output_dim, d_model)
         if pos_encoding_type == 'sinusoidal':
+            # Decoder typically uses standard positional encoding
             self.decoder_pos_encoding = SinusoidalPositionalEncoding(d_model)
         else:
             self.decoder_pos_encoding = LearnedPositionalEncoding(d_model)

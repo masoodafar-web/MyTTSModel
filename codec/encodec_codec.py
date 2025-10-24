@@ -70,7 +70,61 @@ class Encodec24k:
             except Exception:
                 y = librosa.resample(y, orig_sr=int(sr), target_sr=24000, res_type="kaiser_best")
 
-        inputs = self.processor(audio=y, sampling_rate=24000, return_tensors="pt")
+        inputs = self.processor(raw_audio=y, sampling_rate=24000, return_tensors="pt")
+        input_values = inputs["input_values"].to(self.device)
+        padding_mask = inputs.get("padding_mask")
+        if padding_mask is not None:
+            padding_mask = padding_mask.to(self.device)
+
+        with torch.no_grad():
+            enc = self.model.encode(input_values, padding_mask=padding_mask)
+            codes = enc.audio_codes  # expected [B, K, T] or [B, T, K]
+        codes = codes[0]
+        cfg = self.info
+
+        # Normalize shape to [T, K]
+        if codes.ndim != 2:
+            codes = codes.view(codes.shape[0], -1)
+        T0, T1 = codes.shape[0], codes.shape[1]
+        K = cfg['num_codebooks'] or min(T0, T1)
+        if T0 == K:
+            codes = codes.transpose(0, 1)  # [K, T] -> [T, K]
+        elif T1 == K:
+            pass  # already [T, K]
+        else:
+            # Heuristic: assume [K, T]
+            if T0 < T1:
+                codes = codes.transpose(0, 1)
+
+        codes_np = codes.detach().cpu().numpy().astype(np.int32)
+        return codes_np, cfg
+
+    def encode_path_to_codes_from_array(self, audio_array: "np.ndarray", sr: int) -> "tuple[np.ndarray, dict]":
+        """
+        Encode a numpy audio array into Encodec RVQ code indices.
+
+        Args:
+            audio_array: np.ndarray [T] mono float32 in [-1, 1]
+            sr: sampling rate of audio_array
+
+        Returns:
+            (codes, meta) where codes has shape [T, K] (time, num_codebooks), dtype int32
+            meta includes num_codebooks and codebook_size
+        """
+        import numpy as np
+        import librosa
+        import torch
+
+        y = audio_array
+        if y.ndim == 2:
+            y = y.mean(axis=1)
+        if int(sr) != 24000:
+            try:
+                y = librosa.resample(y, orig_sr=int(sr), target_sr=24000, res_type="soxr_hq")
+            except Exception:
+                y = librosa.resample(y, orig_sr=int(sr), target_sr=24000, res_type="kaiser_best")
+
+        inputs = self.processor(raw_audio=y, sampling_rate=24000, return_tensors="pt")
         input_values = inputs["input_values"].to(self.device)
         padding_mask = inputs.get("padding_mask")
         if padding_mask is not None:
@@ -163,7 +217,7 @@ class Encodec24k:
 
         # HF processor expects shape [batch, channels, time]
         inputs = self.processor(
-            audio=wav_24k,
+            raw_audio=wav_24k,
             sampling_rate=24000,
             return_tensors="pt",
         )

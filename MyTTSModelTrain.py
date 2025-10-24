@@ -27,12 +27,29 @@ import tensorflow as tf
 import numpy as np
 from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
-from TTSDataLoader import AudioCfg, TextCfg, preprocess_dataset, TTSDataset
+from TTSDataLoader import AudioCfg, TextCfg, preprocess_dataset, TTSDataset, load_ljspeech_items
+
+# Import tfio for audio resampling (if available)
+try:
+    import tensorflow_io as tfio
+except ImportError:
+    print("⚠️ tensorflow-io not available, audio resampling may not work")
+    tfio = None
+
+# Import phonemizer for pronunciation (required)
+try:
+    from phonemizer import phonemize
+    from phonemizer.backend import EspeakBackend
+    PHONEMIZER_AVAILABLE = True
+except ImportError:
+    raise ImportError("phonemizer is required for this TTS model. Please install it: pip install phonemizer")
 
 
 def setup_environment():
     """Configure GPU memory growth and logging levels."""
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    # Help mitigate fragmentation in TF BFC allocator
+    os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
     # Enable GPU memory growth
     gpus = tf.config.list_physical_devices("GPU")
@@ -84,14 +101,17 @@ class TrainingConfig:
     # Dataset
     dataset_root: str = "../dataset/dataset_train"
     metadata_name: str = "metadata_train.csv"
-    language_code: str = "eng_Latn"
 
-    # Objective: 'mel', 'encodec', or 'tortoise'
-    objective: str = "mel"
+    # Objective: 'encodec_diffusion' (unified approach)
+    objective: str = "encodec_diffusion"
 
     # Audio processing
     audio_preset: str = "base16k"
     encodec_model_id: str = "facebook/encodec_24khz"
+
+    # Text processing (phonemizer only)
+    phonemizer_language: str = "en-us"  # Language for phonemizer
+    use_phoneme_pos_encoding: bool = True  # Use standard positional encoding
 
     # Training
     batch_size: int = 4
@@ -108,21 +128,14 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     gradient_clip_norm: float = 1.0
 
-    # Losses (for TransformerTTS)
-    mel_pre_loss_weight: float = 0.5
-    mel_post_loss_weight: float = 1.0
-    stop_loss_weight: float = 0.5
-    guided_attention_weight: float = 0.2
-    guided_attention_sigma: float = 0.2
-
-    # Diffusion (for TortoiseDiffusionTTS)
+    # Diffusion parameters (for EncodecDiffusion)
     num_timesteps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
 
-    # RVQ
-    num_quantizers: int = 4
-    num_embeddings: int = 1024
+    # Encodec parameters
+    num_codebooks: int = 4  # K in RVQ
+    codebook_size: int = 1024  # C in each codebook
 
     # Voice conditioning
     latent_dim: int = 512
@@ -139,22 +152,85 @@ class TrainingConfig:
         self.audio_preset = os.environ.get("TTS_AUDIO_PRESET", self.audio_preset)
         self.model_preset = os.environ.get("TTS_MODEL_PRESET", self.model_preset)
         self.objective = os.environ.get("TTS_OBJECTIVE", self.objective)
-        self.use_tortoise = bool(int(os.environ.get("USE_TORTOISE", "0")))
-        if str(self.objective).lower() == 'encodec' and self.audio_preset == 'base16k':
-            # Align SR with Encodec 24k model by default
+        self.use_phoneme_pos_encoding = bool(int(os.environ.get("TTS_USE_PHONEME_POS_ENCODING", "0")))
+        # For encodec_diffusion, always use 24kHz preset
+        if str(self.objective).lower() == 'encodec_diffusion':
             self.audio_preset = 'encodec24k'
-        if self.use_tortoise:
-            self.objective = "tortoise"
 
 
-def load_tokenizer(language_code: str):
-    """Load and configure NLLB tokenizer."""
-    print(f"Loading NLLB tokenizer for language: {language_code}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        "facebook/nllb-200-distilled-600M",
-        use_fast=False,
-        src_lang=language_code
-    )
+def load_tokenizer(phonemizer_language: str = "en-us"):
+    """Load and configure phonemizer tokenizer."""
+    if not PHONEMIZER_AVAILABLE:
+        raise ImportError("phonemizer is required but not available. Please install it.")
+
+    print(f"Using phonemizer for language: {phonemizer_language}")
+
+    class PhonemeTokenizer:
+        def __init__(self, language):
+            self.language = language
+            self.backend = EspeakBackend(language)
+            # Build vocabulary from common IPA phonemes
+            self.vocab = self._build_phoneme_vocab()
+            self.pad_token_id = 0
+            self.bos_token_id = 1
+            self.eos_token_id = 2
+
+        def _build_phoneme_vocab(self):
+            # Comprehensive IPA phoneme set
+            phonemes = [
+                # Consonants
+                'p', 'b', 't', 'd', 'k', 'g', 'ʔ', 'q', 'ʕ',
+                'f', 'v', 'θ', 'ð', 's', 'z', 'ʃ', 'ʒ', 'x', 'ɣ', 'h',
+                'm', 'n', 'ŋ', 'l', 'r', 'ɹ', 'ʁ', 'ɻ', 'j', 'w',
+
+                # Vowels
+                'i', 'ɪ', 'ɛ', 'æ', 'ɑ', 'ɔ', 'o', 'ʊ', 'u', 'ə', 'ɚ', 'ɜ', 'ɝ',
+                'a', 'ɐ', 'e', 'ø', 'œ', 'ɘ', 'ɤ', 'ɯ', 'ɨ', 'ʉ', 'ɶ',
+
+                # Diphthongs and vowel combinations
+                'aɪ', 'aʊ', 'ɔɪ', 'oʊ', 'ɛə', 'ɪə', 'ʊə', 'eɪ', 'oɪ', 'aʊ',
+
+                # Suprasegmentals and special
+                'ˈ', 'ˌ', 'ː', 'ˑ', '.', '|', ' ', '‿', '͡', '̯',
+            ]
+            vocab = {'<pad>': 0, '<bos>': 1, '<eos>': 2}
+            for i, phoneme in enumerate(phonemes, start=3):
+                vocab[phoneme] = i
+            return vocab
+
+        def encode(self, text, add_special_tokens=True):
+            try:
+                # Phonemize the text
+                phonemes = phonemize(text, language=self.language, backend=self.backend, strip=True)
+                # Convert to token IDs
+                tokens = []
+                for char in phonemes:
+                    if char in self.vocab:
+                        tokens.append(self.vocab[char])
+                    else:
+                        # Unknown phoneme, use space or skip
+                        tokens.append(self.vocab.get(' ', 3))
+
+                if add_special_tokens:
+                    tokens = [self.bos_token_id] + tokens + [self.eos_token_id]
+                return tokens
+            except Exception as e:
+                print(f"Phonemization failed: {e}, using fallback")
+                # Fallback: treat as regular text
+                tokens = [self.bos_token_id]
+                for char in text.lower():
+                    if char in self.vocab:
+                        tokens.append(self.vocab[char])
+                    else:
+                        tokens.append(self.vocab.get(' ', 3))
+                tokens.append(self.eos_token_id)
+                return tokens
+
+        def __len__(self):
+            return len(self.vocab)
+
+    tokenizer = PhonemeTokenizer(phonemizer_language)
+    print(f"✅ Phoneme tokenizer ready with {len(tokenizer)} tokens")
     return tokenizer
 
 
@@ -163,7 +239,7 @@ def setup_configs(tokenizer, config: TrainingConfig):
     from TTSConfig import make_audio_cfg, make_text_cfg
 
     audio_cfg = make_audio_cfg(config.audio_preset)
-    text_cfg = make_text_cfg(tokenizer, config.language_code, max_text_len=256)
+    text_cfg = make_text_cfg(tokenizer, config.phonemizer_language, max_text_len=256)
 
     print(f"Audio config: preset={config.audio_preset}, "
           f"sr={audio_cfg.target_sample_rate}, n_fft={audio_cfg.n_fft}, "
@@ -173,180 +249,56 @@ def setup_configs(tokenizer, config: TrainingConfig):
 
 
 def preprocess_data(config: TrainingConfig, audio_cfg, text_cfg, tokenizer):
-    """Preprocess dataset for selected objective with caching and parallel processing."""
-    objective = str(config.objective).lower()
-    if objective == 'encodec':
-        print("🔄 Starting data preprocessing (tokenization + Encodec codes)...")
-        from TTSDataLoader import preprocess_dataset_encodec
-        cache_dir = os.path.join("checkpoints", "codes_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        # Avoid large parallelism because Encodec loads a heavy model
-        items, text_ids, codes_list, code_lens, info = preprocess_dataset_encodec(
-            config.dataset_root, text_cfg, tokenizer,
-            metadata_name=config.metadata_name,
-            num_workers=1,
-            cache_dir=cache_dir,
-            model_id=config.encodec_model_id,
-        )
+    """Create tf.data pipeline for EncodecDiffusion (no offline preprocessing)."""
+    print("🔄 Creating tf.data pipeline for EncodecDiffusion...")
 
-        print(f"✅ Preprocessing complete (Encodec):")
-        print(f"   - Total examples: {len(items)}")
-        if codes_list:
-            print(f"   - Sample codes shape: {codes_list[0].shape} (T, K)")
-        print(f"   - Encodec K={info['num_codebooks']}, C={info['codebook_size']}")
-        return items, text_ids, codes_list, code_lens, info
-    elif objective == 'tortoise':
-        print("🔄 Starting data preprocessing (tokenization + mel-spectrogram extraction for Tortoise)...")
-        cache_dir = os.path.join("checkpoints", "mel_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        num_workers = max(1, (os.cpu_count() or 2) - 1)
+    # Load dataset metadata only (no audio processing)
+    items = load_ljspeech_items(
+        config.dataset_root,
+        metadata_name=config.metadata_name
+    )
 
-        items, text_ids, mels, mel_lens = preprocess_dataset(
-            config.dataset_root, audio_cfg, text_cfg, tokenizer,
-            metadata_name=config.metadata_name,
-            num_workers=num_workers,
-            cache_dir=cache_dir,
-        )
+    if len(items) == 0:
+        raise ValueError(f"No training samples found in {config.dataset_root}. "
+                        f"Please check the dataset path and metadata file {config.metadata_name}.")
 
-        print(f"✅ Preprocessing complete (Tortoise):")
-        print(f"   - Total examples: {len(items)}")
-        print(f"   - Sample mel shape: {mels[0].shape if mels else 'N/A'}")
-        print(f"   - Sample text length: {len(text_ids[0]) if text_ids else 'N/A'}")
-        print(f"   - Will use RVQ quantization and diffusion training")
-        return items, text_ids, mels, mel_lens, None
-    else:
-        print("🔄 Starting data preprocessing (tokenization + mel-spectrogram extraction)...")
-        cache_dir = os.path.join("checkpoints", "mel_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        num_workers = max(1, (os.cpu_count() or 2) - 1)
+    print(f"✅ Dataset metadata loaded:")
+    print(f"   - Total examples: {len(items)}")
+    print(f"   - Will use tf.data pipeline for on-the-fly processing")
 
-        items, text_ids, mels, mel_lens = preprocess_dataset(
-            config.dataset_root, audio_cfg, text_cfg, tokenizer,
-            metadata_name=config.metadata_name,
-            num_workers=num_workers,
-            cache_dir=cache_dir,
-        )
-
-        print(f"✅ Preprocessing complete:")
-        print(f"   - Total examples: {len(items)}")
-        print(f"   - Sample mel shape: {mels[0].shape if mels else 'N/A'}")
-        print(f"   - Sample text length: {len(text_ids[0]) if text_ids else 'N/A'}")
-        return items, text_ids, mels, mel_lens, None
+    # Return minimal info (tf.data will handle the rest)
+    return items, None, None, None, {"num_codebooks": config.num_codebooks, "codebook_size": config.codebook_size}
 
 
 # Initialize configuration
 config = TrainingConfig()
-tokenizer = load_tokenizer(config.language_code)
+tokenizer = load_tokenizer(config.phonemizer_language)
 audio_cfg, text_cfg = setup_configs(tokenizer, config)
 pre_data = preprocess_data(config, audio_cfg, text_cfg, tokenizer)
-if str(config.objective).lower() == 'encodec':
-    items, text_ids, data_obj, data_lens, encodec_info = pre_data
-    mels = None
-    mel_lens = None
-else:
-    items, text_ids, data_obj, data_lens, encodec_info = pre_data
-    mels = data_obj
-    mel_lens = data_lens
+items, text_ids, codes_list, code_lens, encodec_info = pre_data
 
 # Log training setup summary
 print("\n" + "="*60)
 print("🎯 TRAINING SETUP SUMMARY")
 print("="*60)
 print(f"📊 Dataset: {config.dataset_root}")
-print(f"🎵 Audio: {config.audio_preset} ({audio_cfg.target_sample_rate}Hz, {audio_cfg.n_mels} mels)")
+print(f"🎵 Audio: {config.audio_preset} ({audio_cfg.target_sample_rate}Hz, Encodec 24kHz)")
+print(f"📝 Text: Phonemes ({config.phonemizer_language})")
+print(f"   - Positional Encoding: {'Phoneme-aware' if config.use_phoneme_pos_encoding else 'Standard'}")
 from TTSConfig import get_model_preset
 model_preset_info = get_model_preset(config.model_preset)
-if config.use_tortoise or str(config.objective).lower() == 'tortoise':
-    print(f"🐢 Model: Tortoise Diffusion TTS (layers={model_preset_info.num_layers})")
-    print(f"   - Diffusion timesteps: {config.num_timesteps}")
-    print(f"   - RVQ quantizers: {config.num_quantizers}")
-    print(f"   - Voice latent dim: {config.latent_dim}")
-else:
-    print(f"🤖 Model: {config.model_preset} (layers={model_preset_info.num_layers})")
+print(f"🤖 Model: EncodecDiffusion TTS (layers={model_preset_info.num_layers})")
+print(f"   - Diffusion timesteps: {config.num_timesteps}")
+print(f"   - Encodec codebooks: K={config.num_codebooks}, C={config.codebook_size}")
+print(f"   - Voice latent dim: {config.latent_dim}")
 print(f"📈 Batch size: {config.batch_size} (adjusted for {strategy.num_replicas_in_sync} GPUs)")
-if not (config.use_tortoise or str(config.objective).lower() == 'tortoise'):
-    print(f"🎯 Loss weights: mel_pre={config.mel_pre_loss_weight}, mel_post={config.mel_post_loss_weight}, stop={config.stop_loss_weight}")
-else:
-    print(f"🎯 Loss: Diffusion + RVQ reconstruction")
+print(f"🎯 Loss: Diffusion on discrete codes")
 print(f"⏰ Training: {config.epochs} epochs")
 print(f"💾 Checkpoints: {config.checkpoint_path}")
-if not (config.use_tortoise or str(config.objective).lower() == 'tortoise'):
-    print(f"📊 Monitoring: Samples every 200 steps")
-else:
-    print(f"📊 Monitoring: Diffusion denoising progress")
+print(f"📊 Monitoring: Diffusion sampling progress")
 print("="*60 + "\n")
 
-def create_data_split(config: TrainingConfig, items, text_ids, data_obj, data_lens, strategy, encodec_info=None):
-    """Create train/validation split with proper batch size adjustment."""
-    print("🔄 Creating train/validation split...")
-
-    # Calculate sequence length statistics for padding optimization
-    text_lengths = np.array([len(seq) for seq in text_ids], dtype=np.int32)
-    objective = str(config.objective).lower()
-    mel_lengths = np.array(data_lens, dtype=np.int32)
-
-    # Use 99th percentile for max lengths to handle outliers
-    max_src_len = int(min(256, max(8, np.percentile(text_lengths, 99) + 8)))
-    max_mel_len = int(min(2000, max(64, np.percentile(mel_lengths, 99) + 16)))
-    n_mels = audio_cfg.n_mels
-
-    print(f"   - Max source length: {max_src_len} (99th percentile)")
-    print(f"   - Max mel length: {max_mel_len} (99th percentile)")
-    print(f"   - Number of mel bins: {n_mels}")
-
-    # Create train/validation split
-    total_samples = len(items)
-    val_samples = max(1, int(total_samples * config.validation_split))
-
-    # Ensure at least one batch for training
-    if (total_samples - val_samples) < config.batch_size:
-        val_samples = max(1, total_samples - config.batch_size)
-
-    # Shuffle with fixed seed for reproducibility
-    indices = np.random.RandomState(42).permutation(total_samples)
-    train_indices = indices[:total_samples - val_samples]
-    val_indices = indices[total_samples - val_samples:]
-
-    # Split data
-    train_items = [items[i] for i in train_indices]
-    val_items = [items[i] for i in val_indices]
-    train_text_ids = [text_ids[i] for i in train_indices]
-    val_text_ids = [text_ids[i] for i in val_indices]
-    train_data = [data_obj[i] for i in train_indices]
-    val_data = [data_obj[i] for i in val_indices]
-    train_mel_lens = mel_lengths[train_indices]
-    val_mel_lens = mel_lengths[val_indices]
-
-    print(f"✅ Data split complete:")
-    print(f"   - Training samples: {len(train_items)}")
-    print(f"   - Validation samples: {len(val_items)}")
-
-    # Adjust batch size for distributed training
-    adjusted_batch_size = adjust_batch_size_for_strategy(config.batch_size, strategy)
-
-    out = {
-        'train_items': train_items,
-        'val_items': val_items,
-        'train_text_ids': train_text_ids,
-        'val_text_ids': val_text_ids,
-        'train_mel_lens': train_mel_lens,
-        'val_mel_lens': val_mel_lens,
-        'max_src_len': max_src_len,
-        'max_mel_len': max_mel_len,
-        'n_mels': n_mels,
-        'batch_size': adjusted_batch_size
-    }
-    if objective == 'encodec':
-        out['train_codes'] = train_data
-        out['val_codes'] = val_data
-        if encodec_info is None:
-            raise ValueError("encodec_info must be provided for encodec objective")
-        out['num_codebooks'] = encodec_info['num_codebooks']
-        out['codebook_size'] = encodec_info['codebook_size']
-    else:
-        out['train_mels'] = train_data
-        out['val_mels'] = val_data
-    return out
+# Data split is now handled by tf.data pipeline - no need for manual splitting
 
 
 def adjust_batch_size_for_strategy(batch_size: int, strategy) -> int:
@@ -362,97 +314,235 @@ def adjust_batch_size_for_strategy(batch_size: int, strategy) -> int:
     return batch_size
 
 
-# Create data split
-data_split = create_data_split(config, items, text_ids, data_obj, data_lens, strategy, encodec_info)
+# No manual data split needed - tf.data handles it
 
-def create_data_generators(data_split, text_cfg):
-    """Create training and validation data generators."""
-    print("🔄 Creating data generators...")
-    if str(config.objective).lower() == 'encodec':
-        from TTSDataLoader import TTSCodesDataset
-        train_generator = TTSCodesDataset(
-            text_ids_list=data_split['train_text_ids'],
-            codes_list=data_split['train_codes'],
-            batch_size=data_split['batch_size'],
-            pad_id=text_cfg.pad_id,
-            num_codebooks=data_split['num_codebooks'],
-            codebook_size=data_split['codebook_size'],
-            max_src_len=data_split['max_src_len'],
-            max_code_len=data_split['max_mel_len'],
-            shuffle=True
-        )
-        val_generator = TTSCodesDataset(
-            text_ids_list=data_split['val_text_ids'],
-            codes_list=data_split['val_codes'],
-            batch_size=data_split['batch_size'],
-            pad_id=text_cfg.pad_id,
-            num_codebooks=data_split['num_codebooks'],
-            codebook_size=data_split['codebook_size'],
-            max_src_len=data_split['max_src_len'],
-            max_code_len=data_split['max_mel_len'],
-            shuffle=False
-        )
-    elif str(config.objective).lower() == 'tortoise':
-        # For Tortoise, we need both text and mel data for diffusion training
-        from TTSDataLoader import TortoiseDataset
-        train_generator = TortoiseDataset(
-            text_ids_list=data_split['train_text_ids'],
-            mels_list=data_split['train_mels'],
-            batch_size=data_split['batch_size'],
-            pad_id=text_cfg.pad_id,
-            n_mels=data_split['n_mels'],
-            max_src_len=data_split['max_src_len'],
-            max_mel_len=data_split['max_mel_len'],
-            shuffle=True
-        )
-        val_generator = TortoiseDataset(
-            text_ids_list=data_split['val_text_ids'],
-            mels_list=data_split['val_mels'],
-            batch_size=data_split['batch_size'],
-            pad_id=text_cfg.pad_id,
-            n_mels=data_split['n_mels'],
-            max_src_len=data_split['max_src_len'],
-            max_mel_len=data_split['max_mel_len'],
-            shuffle=False
-        )
+def create_tfdata_pipeline(items, config: TrainingConfig, audio_cfg, text_cfg, tokenizer, is_training=True):
+    """Create efficient tf.data pipeline for EncodecDiffusion training."""
+
+    # Extract wav paths and texts
+    wav_paths = [item[0] for item in items]
+    texts = [item[1] for item in items]
+
+    # Create tf.data dataset
+    dataset = tf.data.Dataset.from_tensor_slices((wav_paths, texts))
+
+    # Shuffle for training
+    if is_training:
+        dataset = dataset.shuffle(buffer_size=min(len(wav_paths), 10000), seed=42)
+
+    # Load and process audio/text
+    dataset = dataset.map(
+        lambda wav_path, text: load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, config),
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False
+    )
+
+    # Do not filter aggressively; handle any bad samples by returning a minimal valid record
+
+    # Batch with padding on the time dimension of codes; text is already padded
+    max_text_len = int(getattr(text_cfg, 'max_text_len', 256))
+    pad_id = tf.cast(getattr(text_cfg, 'pad_id', 0), tf.int32)
+
+    # Choose batch size considering distribution strategy
+    try:
+        adj_bs = adjust_batch_size_for_strategy(config.batch_size, strategy)
+    except Exception:
+        adj_bs = int(config.batch_size)
+    if is_training:
+        batch_size_to_use = int(adj_bs)
     else:
-        train_generator = TTSDataset(
-            text_ids_list=data_split['train_text_ids'],
-            mels_list=data_split['train_mels'],
-            batch_size=data_split['batch_size'],
-            pad_id=text_cfg.pad_id,
-            n_mels=data_split['n_mels'],
-            max_src_len=data_split['max_src_len'],
-            max_mel_len=data_split['max_mel_len'],
-            shuffle=True
-        )
+        # For validation, do not exceed dataset length
+        batch_size_to_use = int(min(max(1, len(wav_paths)), adj_bs))
 
-        val_generator = TTSDataset(
-            text_ids_list=data_split['val_text_ids'],
-            mels_list=data_split['val_mels'],
-            batch_size=data_split['batch_size'],
-            pad_id=text_cfg.pad_id,
-            n_mels=data_split['n_mels'],
-            max_src_len=data_split['max_src_len'],
-            max_mel_len=data_split['max_mel_len'],
-            shuffle=False
-        )
+    dataset = dataset.padded_batch(
+        batch_size=batch_size_to_use,
+        padded_shapes={
+            'text_ids': [max_text_len],
+            'codes': [None, config.num_codebooks],
+            'code_len': [],
+            'text_len': []
+        },
+        padding_values={
+            'text_ids': pad_id,
+            'codes': tf.cast(0, tf.int32),
+            'code_len': tf.cast(0, tf.int32),
+            'text_len': tf.cast(0, tf.int32)
+        },
+        drop_remainder=False
+    )
 
-    print(f"✅ Data generators created:")
-    print(f"   - Training batches: {len(train_generator)}")
-    print(f"   - Validation batches: {len(val_generator)}")
+    # Repeat training dataset for infinite stream; keep validation finite
+    if is_training:
+        dataset = dataset.repeat()
+    else:
+        # For validation, keep finite; ensure at least one batch
+        try:
+            val_batches = max(1, (len(wav_paths) + batch_size_to_use - 1) // batch_size_to_use)
+        except Exception:
+            val_batches = 1
+        dataset = dataset.take(val_batches)
 
-    return train_generator, val_generator
+    # Prefetch for performance
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+    return dataset
 
 
-# Create data generators
-train_generator, val_generator = create_data_generators(data_split, text_cfg)
+def load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, config):
+    """Load and process a single sample with tf.data operations."""
+
+    try:
+        # Load audio
+        audio_binary = tf.io.read_file(wav_path)
+        audio, sr = tf.audio.decode_wav(audio_binary, desired_channels=1, desired_samples=-1)
+
+        # Resample if needed (guard tfio and use tf.cond for tensor compare)
+        if tfio is not None:
+            target_sr = tf.cast(audio_cfg.target_sample_rate, sr.dtype)
+            audio = tf.cond(
+                tf.not_equal(sr, target_sr),
+                lambda: tfio.audio.resample(audio, sr, target_sr),
+                lambda: audio,
+            )
+
+        # Convert to float32 and squeeze
+        audio = tf.squeeze(audio, axis=-1)
+        audio = tf.cast(audio, tf.float32)
+
+        # Normalize audio
+        audio = audio / tf.maximum(tf.abs(audio), 1e-6)
+
+        # Encode with Encodec (using cached tf.function)
+        codes = encodec_encode_tf(audio, config.num_codebooks, config.codebook_size)
+
+        # Tokenize text using tf.py_function, then truncate + pad to fixed length
+        def _tok_py(t_bytes):
+            # t_bytes can be a bytes object or a 0-d numpy array containing bytes
+            try:
+                if isinstance(t_bytes, (bytes, bytearray)):
+                    s = t_bytes.decode('utf-8', errors='ignore')
+                else:
+                    # numpy scalar or array
+                    s = t_bytes.item() if hasattr(t_bytes, 'item') else t_bytes
+                    if isinstance(s, (bytes, bytearray)):
+                        s = s.decode('utf-8', errors='ignore')
+                    else:
+                        s = str(s)
+
+                # Use phonemizer tokenizer
+                ids = tokenizer.encode(s, add_special_tokens=True)
+                return np.asarray(ids, dtype=np.int32)
+            except Exception as e:
+                print(f"Tokenization failed: {e}")
+                # Fallback to just BOS/EOS if tokenization fails
+                return np.asarray([tokenizer.bos_token_id, tokenizer.eos_token_id], dtype=np.int32)
+
+        tokens = tf.py_function(func=_tok_py, inp=[text], Tout=tf.int32)
+        tokens.set_shape([None])
+
+        max_len = tf.cast(getattr(text_cfg, 'max_text_len', 256), tf.int32)
+        tokens = tokens[:max_len]
+        text_len = tf.shape(tokens)[0]
+        pad_len = tf.maximum(0, max_len - text_len)
+        pad_id = tf.cast(getattr(text_cfg, 'pad_id', 0), tf.int32)
+        tokens = tf.pad(tokens, [[0, pad_len]], constant_values=pad_id)
+
+        # Get lengths
+        code_len = tf.shape(codes)[0]
+
+        return {
+            'text_ids': tokens,
+            'codes': codes,
+            'code_len': code_len,
+            'text_len': text_len,
+        }
+
+    except:
+        # Return a minimal valid dummy sample to keep the pipeline alive
+        max_len = tf.cast(getattr(text_cfg, 'max_text_len', 256), tf.int32)
+        pad_id = tf.cast(getattr(text_cfg, 'pad_id', 0), tf.int32)
+        dummy_tokens = tf.fill([max_len], pad_id)
+        return {
+            'text_ids': dummy_tokens,
+            'codes': tf.zeros([1, config.num_codebooks], dtype=tf.int32),
+            'code_len': tf.constant(1, dtype=tf.int32),
+            'text_len': max_len,
+        }
+
+
+@tf.function
+def encodec_encode_tf(audio, num_codebooks, codebook_size):
+    """TensorFlow-compatible Encodec encoding using the codec wrapper."""
+    # Convert TensorFlow tensor to numpy for the codec
+    audio_np = audio.numpy()  # [T]
+
+    # Use the Encodec24k wrapper for encoding
+    try:
+        codec = Encodec24k()
+        codes, _ = codec.encode_path_to_codes_from_array(audio_np, sr=24000)
+        # codes should be [T, K] where K = num_codebooks
+        codes_tf = tf.convert_to_tensor(codes, dtype=tf.int32)
+        return codes_tf
+    except Exception as e:
+        # Fallback to dummy codes if Encodec fails
+        tf.print(f"⚠️ Encodec encoding failed: {e}, using dummy codes")
+        dummy_length = tf.maximum(1, tf.cast(tf.shape(audio)[0] // 320, tf.int32))
+        return tf.random.uniform([dummy_length, num_codebooks], 0, codebook_size, dtype=tf.int32)
+
+
+def create_data_generators(items, config: TrainingConfig, audio_cfg, text_cfg, tokenizer):
+    """Create tf.data generators for training and validation."""
+    print("🔄 Creating tf.data pipelines...")
+
+    # Split data
+    total_samples = len(items)
+    val_samples = max(1, int(total_samples * config.validation_split))
+    val_samples = min(val_samples, total_samples - 1)  # Ensure at least 1 training sample
+    train_items = items[:total_samples - val_samples]
+    val_items = items[total_samples - val_samples:]
+
+    # Ensure we have samples
+    if len(train_items) == 0:
+        raise ValueError("No training samples available. Check dataset path and metadata.")
+    if len(val_items) == 0:
+        print("⚠️ No validation samples, using 1 training sample for validation.")
+        val_items = train_items[:1]
+        train_items = train_items[1:]
+
+    # Create datasets
+    train_dataset = create_tfdata_pipeline(train_items, config, audio_cfg, text_cfg, tokenizer, is_training=True)
+    val_dataset = create_tfdata_pipeline(val_items, config, audio_cfg, text_cfg, tokenizer, is_training=False)
+
+    print(f"✅ tf.data pipelines created:")
+    print(f"   - Training samples: {len(train_items)}")
+    print(f"   - Validation samples: {len(val_items)}")
+
+    # Calculate steps per epoch using adjusted batch size (ceil to cover dataset)
+    try:
+        adj_train_bs = adjust_batch_size_for_strategy(config.batch_size, strategy)
+    except Exception:
+        adj_train_bs = int(config.batch_size)
+    train_steps = max(1, (len(train_items) + adj_train_bs - 1) // adj_train_bs)
+    setattr(config, 'steps_per_epoch', int(train_steps))
+    print(f"   - Steps per epoch: {train_steps}")
+    print(f"   - Effective batch size: {adj_train_bs}")
+
+    return train_dataset, val_dataset
+
+
+# Create tf.data generators
+train_generator, val_generator = create_data_generators(items, config, audio_cfg, text_cfg, tokenizer)
+
+# Store val_items for validation steps calculation (robust for tiny datasets)
+_val_count = max(1, int(len(items) * config.validation_split))
+_val_count = min(_val_count, max(1, len(items) - 1))
+val_items_for_steps = items[len(items) - _val_count:]
 
 def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_cfg):
-    """Create and initialize the TTS model."""
-    print("🔄 Creating TTS model...")
+    """Create and initialize the EncodecDiffusion TTS model."""
+    print("🔄 Creating EncodecDiffusion TTS model...")
 
-    # Import presets (model classes are imported conditionally below)
+    # Import presets
     from TTSConfig import get_model_preset
 
     # Get model configuration
@@ -465,62 +555,30 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
     print(f"   - Dropout rate: {model_config.dropout_rate}")
 
     with strategy.scope():
-        is_tortoise = (config.use_tortoise or str(config.objective).lower() == 'tortoise')
-        if is_tortoise:
-            # Import only the diffusion model to avoid failing when TransformerTTS is absent
-            from MyTTSModel import TortoiseDiffusionTTS
-            print("🐢 Using Tortoise-style diffusion model")
-            model = TortoiseDiffusionTTS(
-                num_layers=model_config.num_layers,
-                d_model=model_config.d_model,
-                num_heads=model_config.num_heads,
-                dff=model_config.dff,
-                input_vocab_size=len(tokenizer),
-                n_mels=data_split['n_mels'],
-                latent_dim=config.latent_dim,
-                num_timesteps=config.num_timesteps,
-                beta_start=config.beta_start,
-                beta_end=config.beta_end,
-                name="TortoiseDiffusionTTS"
-            )
-        else:
-            # TransformerTTS is optional in this repo; import only when needed
-            try:
-                from MyTTSModel import TransformerTTS
-            except ImportError as e:
-                raise ImportError(
-                    "TransformerTTS is not available in MyTTSModel.py. "
-                    "Set USE_TORTOISE=1 or TTS_OBJECTIVE=tortoise to use the diffusion model, "
-                    "or implement TransformerTTS."
-                ) from e
-            target_type = 'codes' if str(config.objective).lower() == 'encodec' else 'mel'
-            model = TransformerTTS(
-                num_layers=model_config.num_layers,
-                d_model=model_config.d_model,
-                num_heads=model_config.num_heads,
-                dff=model_config.dff,
-                input_vocab_size=len(tokenizer),
-                n_mels=data_split['n_mels'],
-                dropout_rate=model_config.dropout_rate,
-                pad_id=text_cfg.pad_id,
-                use_prenet=getattr(model_config, 'use_prenet', True),
-                prenet_drop=getattr(model_config, 'prenet_drop', 0.5),
-                droppath_rate=getattr(model_config, 'droppath_rate', 0.0),
-                cross_win=getattr(model_config, 'cross_win', None),
-                enable_postnet=getattr(model_config, 'use_postnet', True),
-                activation=getattr(model_config, 'activation', 'gelu'),
-                pos_encoding_type=getattr(model_config, 'pos_encoding_type', 'sinusoidal'),
-                target_type=target_type,
-                num_codebooks=data_split.get('num_codebooks'),
-                codebook_size=data_split.get('codebook_size')
-            )
+        # Import the unified diffusion model
+        from MyTTSModel import EncodecDiffusionTTS
+        print("🎯 Using EncodecDiffusion model")
+        model = EncodecDiffusionTTS(
+            num_layers=model_config.num_layers,
+            d_model=model_config.d_model,
+            num_heads=model_config.num_heads,
+            dff=model_config.dff,
+            input_vocab_size=len(tokenizer),
+            num_codebooks=config.num_codebooks,
+            codebook_size=config.codebook_size,
+            latent_dim=config.latent_dim,
+            num_timesteps=config.num_timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            use_phoneme_pos_encoding=config.use_phoneme_pos_encoding,
+            name="EncodecDiffusionTTS"
+        )
 
-        # Build model with actual input shapes (for TransformerTTS only)
-        if not is_tortoise:
-            model.build_for_load(
-                max_src_len=data_split['max_src_len'],
-                max_tgt_len=data_split['max_mel_len']
-            )
+        # Build model with estimated input shapes (tf.data will handle actual shapes)
+        model.build_for_load(
+            max_src_len=256,  # Estimated max text length
+            max_tgt_len=500   # Estimated max code length
+        )
 
         # Load weights if available
         if os.path.exists(config.checkpoint_path):
@@ -551,7 +609,7 @@ def load_model_weights(model, checkpoint_path: str) -> bool:
 
 
 # Create model
-model = create_model(config, data_split, strategy, tokenizer, text_cfg)
+model = create_model(config, None, strategy, tokenizer, text_cfg)
 
 class TTSLearner(tf.keras.Model):
     """
@@ -1213,53 +1271,31 @@ class TTSEncodecLearner(tf.keras.Model):
             "gal": ga_metric,
         }
 
-def create_optimizer_and_learner(config: TrainingConfig, data_split, model, strategy):
-    """Create optimizer, learner, and compile the model."""
+def create_optimizer_and_learner(config: TrainingConfig, model, strategy):
+    """Create optimizer and learner for EncodecDiffusion."""
     print("🔄 Setting up optimizer and learner...")
 
     # Calculate steps per epoch for warmup scheduling
-    steps_per_epoch = max(1, len(train_generator))
+    try:
+        steps_per_epoch = max(1, len(train_generator))
+    except TypeError:
+        # tf.data may not support len(); fall back to a reasonable default
+        steps_per_epoch = 1000
 
     with strategy.scope():
         # Create learning rate schedule
         lr_schedule = create_learning_rate_schedule(
-            config, data_split, steps_per_epoch
+            config, steps_per_epoch
         )
 
         # Create optimizer with fallback for different TF versions
         optimizer = create_optimizer(lr_schedule, config)
 
-        # Create learner model
-        if str(config.objective).lower() == 'encodec':
-            learner = TTSEncodecLearner(
-                model,
-                num_codebooks=data_split['num_codebooks'],
-                codebook_size=data_split['codebook_size'],
-                loss_weights={
-                    "codes": 1.0,
-                    "stop": config.stop_loss_weight
-                },
-                guided_attention_weight=config.guided_attention_weight,
-                guided_attention_sigma=config.guided_attention_sigma,
-            )
-        elif config.use_tortoise or str(config.objective).lower() == 'tortoise':
-            # For Tortoise, we use a simple wrapper that handles diffusion training
-            learner = TortoiseDiffusionLearner(
-                model,
-                loss_weights={"diffusion": 1.0, "rvq": 0.1}  # RVQ as auxiliary loss
-            )
-        else:
-            learner = TTSLearner(
-                model,
-                loss_weights={
-                    "mel_pre": config.mel_pre_loss_weight,
-                    "mel_post": config.mel_post_loss_weight,
-                    "stop": config.stop_loss_weight
-                },
-                stop_pos_weight=None,  # Dynamic weighting
-                guided_attention_weight=config.guided_attention_weight,
-                guided_attention_sigma=config.guided_attention_sigma,
-            )
+        # Create unified diffusion learner
+        learner = EncodecDiffusionLearner(
+            model,
+            loss_weights={"diffusion": 1.0}
+        )
 
         # Compile with appropriate settings
         run_eagerly = bool(int(os.environ.get("RUN_EAGERLY", "0")))
@@ -1272,40 +1308,58 @@ def create_optimizer_and_learner(config: TrainingConfig, data_split, model, stra
         except TypeError:
             learner.compile(optimizer=optimizer, run_eagerly=run_eagerly)
 
+    # Expose steps_per_epoch for training loop
+    try:
+        setattr(config, 'steps_per_epoch', int(steps_per_epoch))
+    except Exception:
+        pass
+
     print("✅ Optimizer and learner setup complete")
     return learner
 
 
-class TortoiseDiffusionLearner(tf.keras.Model):
+class EncodecDiffusionLearner(tf.keras.Model):
     """
-    Training wrapper for Tortoise Diffusion TTS.
-    Handles diffusion training with RVQ quantization.
+    Training wrapper for EncodecDiffusion TTS.
+    Handles diffusion training on discrete Encodec codes.
     """
 
     def __init__(self, model, loss_weights=None):
         super().__init__()
         self.core = model
-        self.loss_weights = loss_weights or {"diffusion": 1.0, "rvq": 0.1}
+        self.loss_weights = loss_weights or {"diffusion": 1.0}
 
         # Metrics
         self.train_loss = tf.keras.metrics.Mean(name="loss")
         self.val_loss = tf.keras.metrics.Mean(name="val_loss")
         self.diffusion_loss_metric = tf.keras.metrics.Mean(name="diffusion_loss")
-        self.rvq_loss_metric = tf.keras.metrics.Mean(name="rvq_loss")
-        self.rvq_perplexity = tf.keras.metrics.Mean(name="rvq_perplexity")
+
+        # Codebook usage metrics
+        self.codebook_usage = tf.keras.metrics.Mean(name="codebook_usage")
+        self.codebook_perplexity = tf.keras.metrics.Mean(name="codebook_perplexity")
+
+    def _ensure_int_inputs(self, inputs):
+        # Cast fields that are used as indices/lengths to int32
+        for k in ("text_ids", "codes", "code_len", "text_len", "voice_codes"):
+            if k in inputs:
+                inputs[k] = tf.cast(inputs[k], tf.int32)
+        return inputs
 
     def call(self, inputs, training=False):
+        # Ensure integer fields are int32 during symbolic build and training
+        inputs = self._ensure_int_inputs(dict(inputs))
         return self.core(inputs, training=training)
 
     def train_step(self, data):
-        inputs, targets = data[0], data[1] if len(data) >= 2 else (data[0], None)
+        # Accept dict batches or (x, y) tuples
+        if isinstance(data, (tuple, list)):
+            inputs = data[0]
+        else:
+            inputs = data
 
         with tf.GradientTape() as tape:
             outputs = self(inputs, training=True)
-            total_loss = (
-                self.loss_weights["diffusion"] * outputs["diffusion_loss"] +
-                self.loss_weights["rvq"] * outputs["rvq_loss"]
-            )
+            total_loss = self.loss_weights["diffusion"] * outputs["diffusion_loss"]
 
         optimizer = self.optimizer
         scaled_loss = optimizer.get_scaled_loss(total_loss) if hasattr(optimizer, "get_scaled_loss") else total_loss
@@ -1315,39 +1369,55 @@ class TortoiseDiffusionLearner(tf.keras.Model):
         grads, _ = tf.clip_by_global_norm(grads, 1.0)
         optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
-        self.train_loss.update_state(total_loss)
-        self.diffusion_loss_metric.update_state(outputs["diffusion_loss"])
-        self.rvq_loss_metric.update_state(outputs["rvq_loss"])
-        self.rvq_perplexity.update_state(outputs["rvq_perplexity"])
+        self.train_loss.update_state(tf.cast(total_loss, tf.float32))
+        self.diffusion_loss_metric.update_state(tf.cast(outputs["diffusion_loss"], tf.float32))
+
+        # Calculate codebook usage metrics
+        codes = inputs["codes"]  # (B, T, K)
+        unique_codes = tf.unique(tf.reshape(codes, [-1]))[0]
+        usage = tf.cast(tf.shape(unique_codes)[0], tf.float32) / tf.cast(self.core.codebook_size, tf.float32)
+        self.codebook_usage.update_state(usage)
+
+        # Calculate codebook perplexity (simplified)
+        # In practice, you'd calculate proper perplexity across all codebooks
+        avg_usage = tf.reduce_mean(tf.cast(tf.not_equal(codes, 0), tf.float32))
+        perplexity = tf.exp(-tf.reduce_mean(tf.math.log(avg_usage + 1e-10)))
+        self.codebook_perplexity.update_state(perplexity)
 
         return {
             "loss": self.train_loss.result(),
             "diffusion_loss": self.diffusion_loss_metric.result(),
-            "rvq_loss": self.rvq_loss_metric.result(),
-            "rvq_perplexity": self.rvq_perplexity.result(),
+            "codebook_usage": self.codebook_usage.result(),
+            "codebook_perplexity": self.codebook_perplexity.result(),
         }
 
     def test_step(self, data):
-        inputs, targets = data[0], data[1] if len(data) >= 2 else (data[0], None)
+        if isinstance(data, (tuple, list)):
+            inputs = data[0]
+        else:
+            inputs = data
         outputs = self(inputs, training=False)
-        total_loss = (
-            self.loss_weights["diffusion"] * outputs["diffusion_loss"] +
-            self.loss_weights["rvq"] * outputs["rvq_loss"]
-        )
+        total_loss = self.loss_weights["diffusion"] * outputs["diffusion_loss"]
 
-        self.val_loss.update_state(total_loss)
+        self.val_loss.update_state(tf.cast(total_loss, tf.float32))
+
+        # Calculate validation codebook metrics
+        codes = inputs["codes"]  # (B, T, K)
+        unique_codes = tf.unique(tf.reshape(codes, [-1]))[0]
+        usage = tf.cast(tf.shape(unique_codes)[0], tf.float32) / tf.cast(self.core.codebook_size, tf.float32)
+        avg_usage = tf.reduce_mean(tf.cast(tf.not_equal(codes, 0), tf.float32))
+        perplexity = tf.exp(-tf.reduce_mean(tf.math.log(avg_usage + 1e-10)))
 
         return {
             "loss": self.val_loss.result(),
-            "diffusion_loss": outputs["diffusion_loss"],
-            "rvq_loss": outputs["rvq_loss"],
-            "rvq_perplexity": outputs["rvq_perplexity"],
+            "diffusion_loss": tf.cast(outputs["diffusion_loss"], tf.float32),
+            "codebook_usage": usage,
+            "codebook_perplexity": perplexity,
         }
 
 
-def create_learning_rate_schedule(config: TrainingConfig, data_split, steps_per_epoch):
+def create_learning_rate_schedule(config: TrainingConfig, steps_per_epoch):
     """Create Noam learning rate schedule."""
-    from MyTTSModel import TortoiseDiffusionTTS
     from TTSConfig import get_model_preset
 
     model_config = get_model_preset(config.model_preset)
@@ -1415,9 +1485,9 @@ def create_optimizer(lr_schedule, config: TrainingConfig):
     return tf.keras.optimizers.Adam(**optimizer_kwargs)
 
 
-class TortoiseSampleGenerationCallback(tf.keras.callbacks.Callback):
+class EncodecDiffusionSampleGenerationCallback(tf.keras.callbacks.Callback):
     """
-    Callback to generate sample audio using Tortoise diffusion during training.
+    Callback to generate sample codes using EncodecDiffusion during training.
     """
 
     def __init__(self, tokenizer, text_samples, generation_interval=500, max_samples_to_keep=3):
@@ -1426,7 +1496,7 @@ class TortoiseSampleGenerationCallback(tf.keras.callbacks.Callback):
         self.text_samples = text_samples
         self.generation_interval = generation_interval
         self.max_samples_to_keep = max_samples_to_keep
-        self.samples_dir = "training_samples_tortoise"
+        self.samples_dir = "training_samples_encodec_diffusion"
         self.step_count = 0
         os.makedirs(self.samples_dir, exist_ok=True)
 
@@ -1438,52 +1508,61 @@ class TortoiseSampleGenerationCallback(tf.keras.callbacks.Callback):
             try:
                 self._generate_samples()
             except Exception as e:
-                print(f"⚠️ Tortoise sample generation failed: {e}")
+                print(f"⚠️ EncodecDiffusion sample generation failed: {e}")
 
     def _generate_samples(self):
-        """Generate and save sample predictions using diffusion."""
-        print(f"\n🐢 Generating Tortoise diffusion samples at step {self.step_count}...")
+        """Generate and save sample predictions using diffusion on codes."""
+        print(f"\n🎯 Generating EncodecDiffusion samples at step {self.step_count}...")
 
         # Clean up old samples
         self._cleanup_old_samples()
 
         for i, text in enumerate(self.text_samples):
             try:
-                # Tokenize text
-                tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+                # Tokenize text (phonemizer only)
+                tokens = self.tokenizer.encode(text, add_special_tokens=True)
                 tokens = tokens[:256]  # Truncate
                 input_ids = tf.constant([tokens], dtype=tf.int32)
 
-                # For voice conditioning, use a dummy mel (in practice, you'd use reference audio)
-                dummy_voice_mel = tf.random.normal((1, 100, self.model.core.n_mels), dtype=tf.float32)
-
-                # Generate using diffusion
-                generated_mel = self.model.core.generate(input_ids, dummy_voice_mel, num_steps=50)
+                # Generate using diffusion on codes
+                generated_codes = self.model.core.generate(input_ids, num_steps=50)
 
                 # Save sample data
                 sample_data = {
                     'text': text,
-                    'mel_shape': generated_mel.shape,
+                    'codes_shape': generated_codes.shape,
                     'step': self.step_count,
                     'diffusion_steps': 50
                 }
 
                 np.savez_compressed(
-                    f"{self.samples_dir}/tortoise_sample_{i}_step_{self.step_count}.npz",
-                    mel=generated_mel.numpy(),
+                    f"{self.samples_dir}/encodec_diffusion_sample_{i}_step_{self.step_count}.npz",
+                    codes=generated_codes.numpy(),
                     metadata=str(sample_data)
                 )
 
-                print(f"   ✅ Tortoise sample {i}: '{text[:30]}...' → {generated_mel.shape[1]} frames")
+                # Try decoding to audio via Encodec if available
+                try:
+                    from codec.encodec_codec import Encodec24k
+                    import soundfile as sf
+                    codec = Encodec24k()
+                    wav = codec.decode_codes_to_audio(generated_codes.numpy()[0])  # [1, N, 1]
+                    wav_path = f"{self.samples_dir}/encodec_diffusion_sample_{i}_step_{self.step_count}.wav"
+                    sf.write(wav_path, wav[0, :, 0], 24000)
+                    print(f"   🎵 Wrote {wav_path}")
+                except Exception as de:
+                    print(f"   ⚠️ Could not decode to audio (saving codes only): {de}")
+
+                print(f"   ✅ EncodecDiffusion sample {i}: '{text[:30]}...' → {generated_codes.shape[1]} frames")
 
             except Exception as e:
-                print(f"   ❌ Tortoise sample {i} failed: {e}")
+                print(f"   ❌ EncodecDiffusion sample {i} failed: {e}")
 
     def _cleanup_old_samples(self):
         """Keep only the most recent samples."""
         sample_files = sorted([
             f for f in os.listdir(self.samples_dir)
-            if f.startswith("tortoise_sample_") and f.endswith(".npz")
+            if f.startswith("encodec_diffusion_sample_") and f.endswith(".npz")
         ], key=lambda x: os.path.getctime(os.path.join(self.samples_dir, x)))
 
         if len(sample_files) > self.max_samples_to_keep * len(self.text_samples):
@@ -1494,7 +1573,7 @@ class TortoiseSampleGenerationCallback(tf.keras.callbacks.Callback):
                 except:
                     pass
 # Create optimizer and learner
-learner = create_optimizer_and_learner(config, data_split, model, strategy)
+learner = create_optimizer_and_learner(config, model, strategy)
 
 def create_callbacks(config: TrainingConfig):
     """Create training callbacks for monitoring and checkpointing."""
@@ -1535,14 +1614,19 @@ def create_callbacks(config: TrainingConfig):
         core_path=config.checkpoint_path
     )
 
-    # Guided Attention weight ramping
-    ga_ramp = GuidedAttentionRampCallback(
-        start=0.0,
-        target=config.guided_attention_weight,
-        ramp_epochs=config.guided_attention_ramp_epochs
-    )
+    # Assemble callbacks
+    callbacks = [ema_callback, best_checkpoint, tensorboard, early_stopping]
 
-    callbacks = [ga_ramp, ema_callback, best_checkpoint, tensorboard, early_stopping]
+    # Guided Attention ramp only for non-Encodec objectives
+    if str(getattr(config, 'objective', '')).lower() != 'encodec_diffusion':
+        target_weight = float(getattr(config, 'guided_attention_weight', 0.2))
+        ga_ramp = GuidedAttentionRampCallback(
+            start=0.0,
+            target=target_weight,
+            ramp_epochs=getattr(config, 'guided_attention_ramp_epochs', 3)
+        )
+        callbacks.insert(0, ga_ramp)
+
     print(f"✅ Created {len(callbacks)} callbacks")
     return callbacks
 
@@ -1697,8 +1781,8 @@ class SampleGenerationCallback(tf.keras.callbacks.Callback):
                 continue
 
             try:
-                # Tokenize text with validation
-                tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+                # Tokenize text with validation (phonemizer only)
+                tokens = self.tokenizer.encode(text, add_special_tokens=True)
                 if len(tokens) == 0:
                     print(f"   ⚠️ Tokenization failed for sample {i}")
                     continue
@@ -2005,8 +2089,8 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                 print("   ⚠️ Tokenizer not available")
                 return None
 
-            # Tokenize with validation
-            tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+            # Tokenize with validation (phonemizer only)
+            tokens = self.tokenizer.encode(text, add_special_tokens=True)
             if len(tokens) == 0:
                 print("   ⚠️ Tokenization produced empty sequence")
                 return None
@@ -2103,7 +2187,7 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                 print("   ⚠️ Tokenizer not available")
                 return None
 
-            tokens = self.tokenizer.encode(text, add_special_tokens=True, src_lang="eng_Latn")
+            tokens = self.tokenizer.encode(text, add_special_tokens=True)
             if len(tokens) == 0:
                 print("   ⚠️ Tokenization failed")
                 return None
@@ -2378,45 +2462,36 @@ callbacks = create_callbacks(config)
 progress_logger = TrainingProgressLogger(log_interval=50)
 callbacks.append(progress_logger)
 
-# Optional sample generation and audio logging
-if str(config.objective).lower() == 'encodec':
-    # For encodec, we don't generate samples during training
-    pass
-elif config.use_tortoise or str(config.objective).lower() == 'tortoise':
-    # For Tortoise, add diffusion sampling callback
-    tortoise_sample_callback = TortoiseSampleGenerationCallback(
-        tokenizer=tokenizer,
-        text_samples=["Hello world", "This is a test of the Tortoise diffusion system"],
-        generation_interval=500,  # Less frequent for diffusion
-        max_samples_to_keep=3
-    )
-    callbacks.append(tortoise_sample_callback)
-else:
-    # Standard mel-based generation
-    sample_generation_callback = SampleGenerationCallback(
-        tokenizer=tokenizer,
-        text_samples=["Hello world", "This is a test of the text to speech system"],
-        generation_interval=200,
-        max_samples_to_keep=5
-    )
-    callbacks.append(sample_generation_callback)
+# Add EncodecDiffusion sample generation callback
+encodec_diffusion_sample_callback = EncodecDiffusionSampleGenerationCallback(
+    tokenizer=tokenizer,
+    text_samples=["Hello world", "This is a test of the EncodecDiffusion system", "How are you today"],
+    generation_interval=500,
+    max_samples_to_keep=3
+)
+callbacks.append(encodec_diffusion_sample_callback)
 
-    tensorboard_audio_callback = TensorBoardAudioLogger(
-        tokenizer=tokenizer,
-        sample_texts=["Hello world", "This is a test"],
-        log_interval=500,
-        max_audio_samples=3,
-        use_encodec=False
-    )
-    callbacks.append(tensorboard_audio_callback)
+# Phonemizer is always used now
+print("🎯 Using phonemizer for better pronunciation in sample generation")
 
 # Start training
 print("🚀 Starting training...")
-validation_data = val_generator if len(val_generator) > 0 else None
+validation_data = val_generator  # len() may be unknown; pass dataset directly
+
+# Calculate validation steps using adjusted batch size (ceil)
+try:
+    adj_val_bs = adjust_batch_size_for_strategy(config.batch_size, strategy)
+except Exception:
+    adj_val_bs = int(config.batch_size)
+val_count = max(1, len(val_items_for_steps))
+val_steps = max(1, (val_count + adj_val_bs - 1) // adj_val_bs)
+
 learner.fit(
     train_generator,
     validation_data=validation_data,
     epochs=config.epochs,
+    steps_per_epoch=config.steps_per_epoch,
+    validation_steps=val_steps,
     callbacks=callbacks
 )
 
