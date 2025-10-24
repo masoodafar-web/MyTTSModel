@@ -129,6 +129,7 @@ class Encodec24k:
             (codes, meta) where codes has shape [T, K] (time, num_codebooks), dtype int32
             meta includes num_codebooks and codebook_size
         """
+        import numpy as np
         codes, cfg = self._encode_audio_array(audio_array, sr)
         # Ensure codes are int32 for TensorFlow compatibility
         codes_np = codes.detach().cpu().numpy().astype(np.int32)
@@ -149,36 +150,36 @@ class Encodec24k:
 
         # Prefer inferring K from the provided codes to avoid relying on config
         codes_np = np.asarray(codes)
-        # Normalize shape to [B, T, K]
+
         if codes_np.ndim == 1:
-            # Ambiguous; treat as [T] with K=1
+            # Treat as [T] with K=1
             codes_np = codes_np[:, None]
+
         if codes_np.ndim == 2:
-            # [T, K] → [1, T, K]
+            # [T, K] -> [chunks=1, batch=1, K, T]
+            codes_np = codes_np.T[None, None, ...]
+        elif codes_np.ndim == 3:
+            # Assume [B, T, K]; transpose to [chunks=1, B, K, T]
+            codes_np = np.transpose(codes_np, (0, 2, 1))
             codes_np = codes_np[None, ...]
-        elif codes_np.ndim != 3:
-            raise ValueError(f"Expected codes with 2 or 3 dims, got shape {codes_np.shape}")
+        elif codes_np.ndim == 4:
+            # Assume either [chunks, batch, K, T] or [chunks, batch, T, K]
+            if codes_np.shape[2] != codes_np.shape[3] and codes_np.shape[3] in (1, 2, 4, 8, 16):
+                # Heuristic: if last dim matches plausible codebook counts, swap
+                codes_np = np.transpose(codes_np, (0, 1, 3, 2))
+        else:
+            raise ValueError(f"Expected codes with 2-4 dims, got shape {codes_np.shape}")
 
-        # Ensure we have the correct shape [B, T, K]
-        B, T, K = codes_np.shape
-
-        if self.verbose:
-            print(f"🔍 Debug decode: input shape {codes_np.shape}, B={B}, T={T}, K={K}")
-
-        # to torch: [B, K, T]
-        # Build dense tensor on CPU first to avoid any odd sparse pathways, then move to device
-        codes_t = torch.from_numpy(codes_np.astype(np.int64, copy=False)).contiguous()
-        if self.verbose:
-            print(f"🔍 Debug decode: torch tensor shape {codes_t.shape}")
-
-        # Explicitly convert to [B, K, T] format expected by Encodec
-        # codes_t is currently [B, T, K], we need [B, K, T]
-        codes_t = codes_t.permute(0, 2, 1).contiguous()
+        chunks, batch, num_codebooks, frames = codes_np.shape
 
         if self.verbose:
-            print(f"🔍 Debug decode: final torch shape {codes_t.shape}")
-        codes_t = codes_t.to(self.device)
-        scales = torch.ones((B, K), dtype=torch.float32, device=self.device)
+            print(f"🔍 Debug decode: normalized numpy shape {codes_np.shape}")
+
+        # to torch with shape [chunks, batch, num_codebooks, frames]
+        codes_t = torch.from_numpy(codes_np.astype(np.int64, copy=False)).contiguous().to(self.device)
+
+        # Scales: Encodec expects shape [chunks, batch]
+        scales = torch.ones((chunks, batch), dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             decoded = self.model.decode(codes_t, audio_scales=scales)

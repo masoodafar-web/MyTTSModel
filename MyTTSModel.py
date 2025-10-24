@@ -406,12 +406,14 @@ class EncodecDiffusionTTS(tf.keras.Model):
                  latent_dim=512, num_timesteps=1000,
                  beta_start=1e-4, beta_end=0.02,
                  use_phoneme_pos_encoding=False,
+                 pad_token_id=0,
                  name="EncodecDiffusionTTS"):
         super().__init__(name=name)
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
         self.num_timesteps = num_timesteps
         self.use_phoneme_pos_encoding = use_phoneme_pos_encoding
+        self.pad_id = int(pad_token_id)
 
         # Text encoder (transformer encoder)
         self.text_encoder = tf.keras.Sequential([
@@ -429,7 +431,8 @@ class EncodecDiffusionTTS(tf.keras.Model):
         # that can trigger GPU OOM with very large vocabularies (e.g., ~256k for NLLB).
         # You can unfreeze later once training stabilizes or switch to an embedding-aware optimizer.
         # For fine-tuning, set self.text_encoder.trainable = True after initial training
-        self.text_encoder.trainable = False
+        # Enable fine-tuning for text encoder after initial training stabilizes
+        self.text_encoder.trainable = True
 
         # Separate transformer blocks
         self.text_transformer_blocks = []
@@ -570,7 +573,10 @@ class EncodecDiffusionTTS(tf.keras.Model):
             )
         )
 
-        return {"diffusion_loss": diffusion_loss}
+        return {
+            "diffusion_loss": diffusion_loss,
+            "predicted_logits": predicted_logits,
+        }
 
     def generate(self, text_ids, voice_codes=None, num_steps=50):
         """
@@ -584,15 +590,27 @@ class EncodecDiffusionTTS(tf.keras.Model):
         Returns:
             Generated codes (B, T, K)
         """
+        text_ids = tf.convert_to_tensor(text_ids)
         B = tf.shape(text_ids)[0]
         if voice_codes is None:
             # Use a minimal dummy reference: zeros indices
-            voice_codes = tf.zeros((B, 1, self.num_codebooks), dtype=tf.int32)
+            voice_codes = tf.zeros(
+                tf.stack([
+                    B,
+                    tf.constant(1, dtype=tf.int32),
+                    tf.constant(self.num_codebooks, dtype=tf.int32)
+                ]),
+                dtype=tf.int32
+            )
+        else:
+            voice_codes = tf.convert_to_tensor(voice_codes, dtype=tf.int32)
         # Adaptive sequence length based on text length
-        text_len = tf.reduce_sum(tf.cast(text_ids != self.text_encoder.layers[0].pad_id, tf.int32), axis=1)  # (B,)
+        text_len = tf.reduce_sum(tf.cast(text_ids != self.pad_id, tf.int32), axis=1)  # (B,)
         avg_text_len = tf.reduce_mean(tf.cast(text_len, tf.float32))
         # Estimate target length: roughly 10-15 frames per phoneme (adjust based on your data)
-        T = tf.maximum(50, tf.minimum(500, tf.cast(avg_text_len * 12.0, tf.int32)))  # Adaptive length
+        # Use a more sophisticated estimation based on phoneme count and typical speech rate
+        estimated_frames_per_phoneme = 12.0  # Adjust based on your data statistics
+        T = tf.maximum(50, tf.minimum(500, tf.cast(avg_text_len * estimated_frames_per_phoneme, tf.int32)))
 
         # Encode text
         text_emb = self.text_encoder(text_ids, training=False)
@@ -609,12 +627,20 @@ class EncodecDiffusionTTS(tf.keras.Model):
         voice_latents = tf.cast(voice_latents, tf.float32)
 
         # Start from noise (uniform distribution)
-        x_t = tf.random.uniform((B, T, self.num_codebooks, self.codebook_size), 0.0, 1.0, dtype=tf.float32)
+        noise_shape = tf.stack([
+            B,
+            tf.cast(T, tf.int32),
+            tf.constant(self.num_codebooks, dtype=tf.int32),
+            tf.constant(self.codebook_size, dtype=tf.int32)
+        ])
+        x_t = tf.random.uniform(noise_shape, 0.0, 1.0, dtype=tf.float32)
         x_t = x_t / tf.reduce_sum(x_t, axis=-1, keepdims=True)  # Normalize to probabilities
 
         # Reverse diffusion
-        for t in reversed(range(0, self.num_timesteps, self.num_timesteps // num_steps)):
-            t_tensor = tf.fill((B,), t)
+        step_size = max(1, self.num_timesteps // max(1, num_steps))
+        batch_shape = tf.shape(text_len)
+        for t in reversed(range(0, self.num_timesteps, step_size)):
+            t_tensor = tf.fill(batch_shape, tf.cast(t, tf.int32))
             x_t = self.p_sample(x_t, t_tensor, text_context, voice_latents, training=False)
 
         # Convert from one-hot to indices

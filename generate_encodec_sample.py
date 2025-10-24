@@ -34,7 +34,7 @@ def setup_tf():
 
 
 def load_core_model(preset: str, vocab_size: int, num_codebooks: int, codebook_size: int,
-                    steps: int, ckpt_path: str):
+                    steps: int, ckpt_path: str, pad_token_id: int = 0):
     from TTSConfig import get_model_preset
     from MyTTSModel import EncodecDiffusionTTS
 
@@ -51,6 +51,7 @@ def load_core_model(preset: str, vocab_size: int, num_codebooks: int, codebook_s
         num_timesteps=1000,
         beta_start=1e-4,
         beta_end=0.02,
+        pad_token_id=pad_token_id,
     )
     # Build and load weights
     model.build_for_load(max_src_len=256, max_tgt_len=500)
@@ -103,8 +104,15 @@ def main():
     codebook_size = 1024
 
     # Load model
-    model = load_core_model(args.preset, vocab_size=len(tok), num_codebooks=num_codebooks,
-                            codebook_size=codebook_size, steps=args.steps, ckpt_path=args.ckpt)
+    model = load_core_model(
+        args.preset,
+        vocab_size=len(tok),
+        num_codebooks=num_codebooks,
+        codebook_size=codebook_size,
+        steps=args.steps,
+        ckpt_path=args.ckpt,
+        pad_token_id=getattr(tok, 'pad_token_id', 0)
+    )
 
     # Generate codes
     print(f"🎯 Generating codes ({args.steps} steps)...")
@@ -129,4 +137,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

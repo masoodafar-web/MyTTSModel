@@ -27,6 +27,11 @@ import tensorflow as tf
 import numpy as np
 from TTSDataLoader import AudioCfg, TextCfg, preprocess_dataset, TTSDataset, load_ljspeech_items
 
+try:
+    from transformers.utils import logging as hf_logging
+except ImportError:
+    hf_logging = None
+
 # Import tfio for audio resampling (if available)
 try:
     import tensorflow_io as tfio
@@ -55,6 +60,55 @@ except ImportError:
     print("⚠️ Audio quality metrics not available (PESQ, STOI). Install: pip install pesq pystoi")
 
 
+if AUDIO_METRICS_AVAILABLE:
+    def _compute_pesq_stoi_np(gt_codes, pred_codes, code_length):
+        """Decode Encodec codes and compute PESQ/STOI in NumPy context."""
+        import numpy as np
+
+        length = int(code_length) if isinstance(code_length, (int, float, np.integer)) else int(code_length.item())
+        if length <= 0:
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+        gt_codes = np.asarray(gt_codes, dtype=np.int64)
+        pred_codes = np.asarray(pred_codes, dtype=np.int64)
+
+        gt_codes = gt_codes[:length]
+        pred_codes = pred_codes[:length]
+
+        try:
+            if not hasattr(_compute_pesq_stoi_np, "_codec"):
+                from codec.encodec_codec import Encodec24k
+                _compute_pesq_stoi_np._codec = Encodec24k()
+            codec = _compute_pesq_stoi_np._codec
+
+            gt_audio = codec.decode_codes_to_audio(gt_codes)[0, :, 0]
+            pred_audio = codec.decode_codes_to_audio(pred_codes)[0, :, 0]
+
+            min_len = min(len(gt_audio), len(pred_audio))
+            if min_len == 0:
+                return np.array([0.0, 0.0], dtype=np.float32)
+
+            gt_audio = gt_audio[:min_len].astype(np.float64, copy=False)
+            pred_audio = pred_audio[:min_len].astype(np.float64, copy=False)
+
+            try:
+                pesq_val = float(pesq.pesq(24000, gt_audio, pred_audio, 'wb'))
+            except Exception:
+                pesq_val = 0.0
+            try:
+                stoi_val = float(pystoi.stoi(gt_audio, pred_audio, 24000, extended=False))
+            except Exception:
+                stoi_val = 0.0
+
+            return np.array([pesq_val, stoi_val], dtype=np.float32)
+        except Exception:
+            return np.array([0.0, 0.0], dtype=np.float32)
+else:
+    def _compute_pesq_stoi_np(gt_codes, pred_codes, code_length):
+        import numpy as np
+        return np.array([0.0, 0.0], dtype=np.float32)
+
+
 def setup_environment():
     """Configure GPU memory growth and logging levels."""
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -74,7 +128,8 @@ def setup_environment():
     tf.get_logger().setLevel(logging.ERROR)
     absl.logging.set_verbosity(absl.logging.ERROR)
     warnings.filterwarnings("ignore")
-    hf_logging.set_verbosity_error()
+    if hf_logging is not None:
+        hf_logging.set_verbosity_error()
 
 
 def setup_mixed_precision():
@@ -614,6 +669,7 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
             beta_start=config.beta_start,
             beta_end=config.beta_end,
             use_phoneme_pos_encoding=config.use_phoneme_pos_encoding,
+            pad_token_id=getattr(text_cfg, 'pad_id', 0),
             name="EncodecDiffusionTTS"
         )
 
@@ -1421,6 +1477,9 @@ class EncodecDiffusionLearner(tf.keras.Model):
         else:
             inputs = data
 
+        codes_target = tf.cast(inputs["codes"], tf.int32)
+        code_len = tf.cast(inputs["code_len"], tf.int32)
+
         with tf.GradientTape() as tape:
             outputs = self(inputs, training=True)
             total_loss = self.loss_weights["diffusion"] * outputs["diffusion_loss"]
@@ -1437,9 +1496,7 @@ class EncodecDiffusionLearner(tf.keras.Model):
         self.diffusion_loss_metric.update_state(tf.cast(outputs["diffusion_loss"], tf.float32))
 
         # Calculate codebook usage metrics with padding mask
-        codes = inputs["codes"]  # (B, T, K)
-        code_len = inputs["code_len"]  # (B,)
-
+        codes = codes_target  # (B, T, K)
         # Create mask for valid (non-padded) positions
         mask = tf.sequence_mask(code_len, maxlen=tf.shape(codes)[1], dtype=tf.bool)  # (B, T)
         mask = tf.tile(mask[..., None], [1, 1, self.core.num_codebooks])  # (B, T, K)
@@ -1473,6 +1530,31 @@ class EncodecDiffusionLearner(tf.keras.Model):
         recon_error = total_loss * 0.1  # Placeholder
         self.code_reconstruction_error.update_state(recon_error)
 
+        pesq_value = tf.constant(0.0, dtype=tf.float32)
+        stoi_value = tf.constant(0.0, dtype=tf.float32)
+        if AUDIO_METRICS_AVAILABLE and hasattr(self, 'pesq_metric'):
+            predicted_logits = outputs.get("predicted_logits")
+            if predicted_logits is not None:
+                predicted_codes = tf.cast(
+                    tf.argmax(tf.stop_gradient(predicted_logits), axis=-1),
+                    tf.int32
+                )
+                first_codes = codes_target[0]
+                first_pred_codes = predicted_codes[0]
+                first_len = code_len[0]
+
+                pesq_stoi = tf.numpy_function(
+                    func=_compute_pesq_stoi_np,
+                    inp=[first_codes, first_pred_codes, first_len],
+                    Tout=tf.float32,
+                    name="compute_train_pesq_stoi"
+                )
+                pesq_stoi.set_shape((2,))
+                pesq_value = tf.cast(pesq_stoi[0], tf.float32)
+                stoi_value = tf.cast(pesq_stoi[1], tf.float32)
+                self.pesq_metric.update_state(pesq_value)
+                self.stoi_metric.update_state(stoi_value)
+
         metrics = {
             "loss": self.train_loss.result(),
             "diffusion_loss": self.diffusion_loss_metric.result(),
@@ -1500,8 +1582,8 @@ class EncodecDiffusionLearner(tf.keras.Model):
         self.val_loss.update_state(tf.cast(total_loss, tf.float32))
 
         # Calculate validation codebook metrics with padding mask
-        codes = inputs["codes"]  # (B, T, K)
-        code_len = inputs["code_len"]  # (B,)
+        codes = tf.cast(inputs["codes"], tf.int32)  # (B, T, K)
+        code_len = tf.cast(inputs["code_len"], tf.int32)  # (B,)
 
         # Create mask for valid (non-padded) positions
         mask = tf.sequence_mask(code_len, maxlen=tf.shape(codes)[1], dtype=tf.bool)  # (B, T)
@@ -1528,6 +1610,29 @@ class EncodecDiffusionLearner(tf.keras.Model):
         self.codebook_usage.update_state(usage)
         self.codebook_perplexity.update_state(perplexity)
 
+        pesq_value = tf.constant(0.0, dtype=tf.float32)
+        stoi_value = tf.constant(0.0, dtype=tf.float32)
+        if AUDIO_METRICS_AVAILABLE:
+            predicted_logits = outputs.get("predicted_logits")
+            if predicted_logits is not None:
+                predicted_codes = tf.cast(
+                    tf.argmax(tf.stop_gradient(predicted_logits), axis=-1),
+                    tf.int32
+                )
+                first_codes = codes[0]
+                first_pred_codes = predicted_codes[0]
+                first_len = code_len[0]
+
+                pesq_stoi = tf.numpy_function(
+                    func=_compute_pesq_stoi_np,
+                    inp=[first_codes, first_pred_codes, first_len],
+                    Tout=tf.float32,
+                    name="compute_val_pesq_stoi"
+                )
+                pesq_stoi.set_shape((2,))
+                pesq_value = tf.cast(pesq_stoi[0], tf.float32)
+                stoi_value = tf.cast(pesq_stoi[1], tf.float32)
+
         metrics = {
             "loss": self.val_loss.result(),
             "diffusion_loss": tf.cast(outputs["diffusion_loss"], tf.float32),
@@ -1537,11 +1642,9 @@ class EncodecDiffusionLearner(tf.keras.Model):
             "code_recon_error": tf.cast(outputs["diffusion_loss"], tf.float32) * 0.1,
         }
 
-        # Add audio quality metrics if available (validation)
-        if AUDIO_METRICS_AVAILABLE and hasattr(self, 'pesq_metric'):
-            # For validation, we could compute metrics on a subset, but for now use placeholders
-            metrics["pesq"] = 0.0  # Placeholder
-            metrics["stoi"] = 0.0  # Placeholder
+        if AUDIO_METRICS_AVAILABLE:
+            metrics["pesq"] = pesq_value
+            metrics["stoi"] = stoi_value
 
         return metrics
 
