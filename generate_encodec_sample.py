@@ -63,8 +63,21 @@ def load_core_model(preset: str, vocab_size: int, num_codebooks: int, codebook_s
 
 
 def tokenize(text: str, lang: str):
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", use_fast=False, src_lang=lang)
+    """Tokenize text using PhonemeTokenizer to match training."""
+    # Import the tokenizer from training script to ensure consistency
+    from MyTTSModelTrain import load_tokenizer
+
+    # Use phonemizer language mapping (same as training)
+    phonemizer_lang = "en-us"  # Default for English
+    if "eng" in lang.lower():
+        phonemizer_lang = "en-us"
+    elif "spa" in lang.lower():
+        phonemizer_lang = "es"
+    elif "fra" in lang.lower():
+        phonemizer_lang = "fr-fr"
+    # Add more language mappings as needed
+
+    tok = load_tokenizer(phonemizer_lang)
     ids = tok.encode(text, add_special_tokens=True)
     return tok, np.array(ids, dtype=np.int32)
 

@@ -317,10 +317,19 @@ class ResBlock(layers.Layer):
         super().__init__(name=name)
         self.channels = channels
 
-        self.norm1 = layers.GroupNormalization(groups=min(32, channels), name="norm1")
+        # Try GroupNormalization, fallback to LayerNormalization if unavailable
+        try:
+            self.norm1 = layers.GroupNormalization(groups=min(32, channels), name="norm1")
+        except (AttributeError, ImportError):
+            self.norm1 = layers.LayerNormalization(epsilon=1e-5, name="norm1")
+
         self.conv1 = layers.Conv1D(channels, 3, padding="same", name="conv1")
 
-        self.norm2 = layers.GroupNormalization(groups=min(32, channels), name="norm2")
+        try:
+            self.norm2 = layers.GroupNormalization(groups=min(32, channels), name="norm2")
+        except (AttributeError, ImportError):
+            self.norm2 = layers.LayerNormalization(epsilon=1e-5, name="norm2")
+
         self.conv2 = layers.Conv1D(channels, 3, padding="same", name="conv2")
 
         self.time_proj = layers.Dense(channels, name="time_proj")
@@ -419,6 +428,7 @@ class EncodecDiffusionTTS(tf.keras.Model):
         # Freeze the large embedding block to avoid massive sparse optimizer updates
         # that can trigger GPU OOM with very large vocabularies (e.g., ~256k for NLLB).
         # You can unfreeze later once training stabilizes or switch to an embedding-aware optimizer.
+        # For fine-tuning, set self.text_encoder.trainable = True after initial training
         self.text_encoder.trainable = False
 
         # Separate transformer blocks
@@ -578,7 +588,11 @@ class EncodecDiffusionTTS(tf.keras.Model):
         if voice_codes is None:
             # Use a minimal dummy reference: zeros indices
             voice_codes = tf.zeros((B, 1, self.num_codebooks), dtype=tf.int32)
-        T = 200  # Target sequence length
+        # Adaptive sequence length based on text length
+        text_len = tf.reduce_sum(tf.cast(text_ids != self.text_encoder.layers[0].pad_id, tf.int32), axis=1)  # (B,)
+        avg_text_len = tf.reduce_mean(tf.cast(text_len, tf.float32))
+        # Estimate target length: roughly 10-15 frames per phoneme (adjust based on your data)
+        T = tf.maximum(50, tf.minimum(500, tf.cast(avg_text_len * 12.0, tf.int32)))  # Adaptive length
 
         # Encode text
         text_emb = self.text_encoder(text_ids, training=False)

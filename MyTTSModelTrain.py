@@ -25,8 +25,6 @@ import warnings
 from dataclasses import dataclass
 import tensorflow as tf
 import numpy as np
-from transformers import AutoTokenizer
-from transformers.utils import logging as hf_logging
 from TTSDataLoader import AudioCfg, TextCfg, preprocess_dataset, TTSDataset, load_ljspeech_items
 
 # Import tfio for audio resampling (if available)
@@ -214,14 +212,27 @@ def load_tokenizer(phonemizer_language: str = "en-us"):
             try:
                 # Phonemize the text
                 phonemes = phonemize(text, language=self.language, backend=self.backend, strip=True)
-                # Convert to token IDs
+                # Convert to token IDs - handle multi-character phonemes
                 tokens = []
-                for char in phonemes:
-                    if char in self.vocab:
-                        tokens.append(self.vocab[char])
-                    else:
-                        # Unknown phoneme, use space or skip
-                        tokens.append(self.vocab.get(' ', 3))
+                i = 0
+                while i < len(phonemes):
+                    # Try multi-character phonemes first (longest match)
+                    found = False
+                    for length in range(min(3, len(phonemes) - i), 0, -1):  # Try 3, 2, 1 chars
+                        candidate = phonemes[i:i+length]
+                        if candidate in self.vocab:
+                            tokens.append(self.vocab[candidate])
+                            i += length
+                            found = True
+                            break
+                    if not found:
+                        # Fallback to single character or space
+                        char = phonemes[i]
+                        if char in self.vocab:
+                            tokens.append(self.vocab[char])
+                        else:
+                            tokens.append(self.vocab.get(' ', 3))
+                        i += 1
 
                 if add_special_tokens:
                     tokens = [self.bos_token_id] + tokens + [self.eos_token_id]
@@ -424,7 +435,7 @@ def load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, conf
         audio = tf.cast(audio, tf.float32)
 
         # Normalize audio
-        audio = audio / tf.maximum(tf.abs(audio), 1e-6)
+        audio = audio / (tf.reduce_max(tf.abs(audio)) + 1e-6)
 
         # Encode with Encodec (using cached tf.function)
         codes = encodec_encode_tf(audio, config.num_codebooks, config.codebook_size)
@@ -483,24 +494,43 @@ def load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, conf
         }
 
 
-@tf.function
 def encodec_encode_tf(audio, num_codebooks, codebook_size):
-    """TensorFlow-compatible Encodec encoding using the codec wrapper."""
-    # Convert TensorFlow tensor to numpy for the codec
-    audio_np = audio.numpy()  # [T]
+    """TensorFlow-compatible Encodec encoding using tf.numpy_function for Graph compatibility."""
 
-    # Use the Encodec24k wrapper for encoding
-    try:
-        codec = Encodec24k()
-        codes, _ = codec.encode_path_to_codes_from_array(audio_np, sr=24000)
-        # codes should be [T, K] where K = num_codebooks
-        codes_tf = tf.convert_to_tensor(codes, dtype=tf.int32)
-        return codes_tf
-    except Exception as e:
-        # Fallback to dummy codes if Encodec fails
-        tf.print(f"⚠️ Encodec encoding failed: {e}, using dummy codes")
-        dummy_length = tf.maximum(1, tf.cast(tf.shape(audio)[0] // 320, tf.int32))
-        return tf.random.uniform([dummy_length, num_codebooks], 0, codebook_size, dtype=tf.int32)
+    def _encodec_encode_py(audio_np):
+        """Python function to handle Encodec encoding."""
+        try:
+            # Use global cached codec instance
+            codec = get_encodec_singleton()
+            codes, _ = codec.encode_path_to_codes_from_array(audio_np, sr=24000)
+            return codes.astype(np.int32)
+        except Exception as e:
+            # Fallback to dummy codes if Encodec fails
+            dummy_length = max(1, len(audio_np) // 320)
+            return np.random.randint(0, codebook_size, (dummy_length, num_codebooks), dtype=np.int32)
+
+    # Use tf.numpy_function to wrap the Python function
+    codes = tf.numpy_function(
+        func=_encodec_encode_py,
+        inp=[audio],
+        Tout=tf.int32,
+        name="encodec_encode"
+    )
+
+    # Set shape hint for TensorFlow graph
+    codes.set_shape([None, num_codebooks])
+    return codes
+
+
+# Global cached Encodec instance to avoid repeated loading
+_encodec_singleton = None
+
+def get_encodec_singleton():
+    """Get or create cached Encodec24k instance."""
+    global _encodec_singleton
+    if _encodec_singleton is None:
+        _encodec_singleton = Encodec24k()
+    return _encodec_singleton
 
 
 def create_data_generators(items, config: TrainingConfig, audio_cfg, text_cfg, tokenizer):
@@ -1406,21 +1436,27 @@ class EncodecDiffusionLearner(tf.keras.Model):
         self.train_loss.update_state(tf.cast(total_loss, tf.float32))
         self.diffusion_loss_metric.update_state(tf.cast(outputs["diffusion_loss"], tf.float32))
 
-        # Calculate codebook usage metrics
+        # Calculate codebook usage metrics with padding mask
         codes = inputs["codes"]  # (B, T, K)
-        # Flatten all codes across batch, time, and codebooks
+        code_len = inputs["code_len"]  # (B,)
+
+        # Create mask for valid (non-padded) positions
+        mask = tf.sequence_mask(code_len, maxlen=tf.shape(codes)[1], dtype=tf.bool)  # (B, T)
+        mask = tf.tile(mask[..., None], [1, 1, self.core.num_codebooks])  # (B, T, K)
+
+        # Flatten only valid codes
         flat_codes = tf.reshape(codes, [-1])  # (B*T*K,)
-        unique_codes = tf.unique(flat_codes)[0]
-        # Remove padding (assuming 0 is padding)
-        unique_codes = tf.boolean_mask(unique_codes, tf.not_equal(unique_codes, 0))
+        flat_mask = tf.reshape(mask, [-1])  # (B*T*K,)
+        valid_codes = tf.boolean_mask(flat_codes, flat_mask)
+
+        # Calculate usage (unique codes / total possible)
+        unique_codes = tf.unique(valid_codes)[0]
         usage = tf.cast(tf.shape(unique_codes)[0], tf.float32) / tf.cast(self.core.codebook_size, tf.float32)
         self.codebook_usage.update_state(usage)
 
-        # Calculate codebook perplexity properly
-        # Count frequency of each code
-        code_counts = tf.math.bincount(flat_codes, minlength=self.core.codebook_size, maxlength=self.core.codebook_size)
+        # Calculate perplexity from valid codes only
+        code_counts = tf.math.bincount(valid_codes, minlength=self.core.codebook_size, maxlength=self.core.codebook_size)
         code_probs = tf.cast(code_counts, tf.float32) / tf.cast(tf.reduce_sum(code_counts), tf.float32)
-        # Remove zero probabilities to avoid log(0)
         code_probs = tf.where(code_probs > 0, code_probs, 1e-10)
         entropy = -tf.reduce_sum(code_probs * tf.math.log(code_probs))
         perplexity = tf.exp(entropy)
@@ -1463,25 +1499,40 @@ class EncodecDiffusionLearner(tf.keras.Model):
 
         self.val_loss.update_state(tf.cast(total_loss, tf.float32))
 
-        # Calculate validation codebook metrics
+        # Calculate validation codebook metrics with padding mask
         codes = inputs["codes"]  # (B, T, K)
+        code_len = inputs["code_len"]  # (B,)
+
+        # Create mask for valid (non-padded) positions
+        mask = tf.sequence_mask(code_len, maxlen=tf.shape(codes)[1], dtype=tf.bool)  # (B, T)
+        mask = tf.tile(mask[..., None], [1, 1, self.core.num_codebooks])  # (B, T, K)
+
+        # Flatten only valid codes
         flat_codes = tf.reshape(codes, [-1])  # (B*T*K,)
-        unique_codes = tf.unique(flat_codes)[0]
-        unique_codes = tf.boolean_mask(unique_codes, tf.not_equal(unique_codes, 0))
+        flat_mask = tf.reshape(mask, [-1])  # (B*T*K,)
+        valid_codes = tf.boolean_mask(flat_codes, flat_mask)
+
+        # Calculate usage (unique codes / total possible)
+        unique_codes = tf.unique(valid_codes)[0]
         usage = tf.cast(tf.shape(unique_codes)[0], tf.float32) / tf.cast(self.core.codebook_size, tf.float32)
 
-        # Calculate perplexity
-        code_counts = tf.math.bincount(flat_codes, minlength=self.core.codebook_size, maxlength=self.core.codebook_size)
+        # Calculate perplexity from valid codes only
+        code_counts = tf.math.bincount(valid_codes, minlength=self.core.codebook_size, maxlength=self.core.codebook_size)
         code_probs = tf.cast(code_counts, tf.float32) / tf.cast(tf.reduce_sum(code_counts), tf.float32)
         code_probs = tf.where(code_probs > 0, code_probs, 1e-10)
         entropy = -tf.reduce_sum(code_probs * tf.math.log(code_probs))
         perplexity = tf.exp(entropy)
 
+        # Update validation metrics
+        self.val_loss.update_state(tf.cast(total_loss, tf.float32))
+        self.codebook_usage.update_state(usage)
+        self.codebook_perplexity.update_state(perplexity)
+
         metrics = {
             "loss": self.val_loss.result(),
             "diffusion_loss": tf.cast(outputs["diffusion_loss"], tf.float32),
-            "codebook_usage": usage,
-            "codebook_perplexity": perplexity,
+            "codebook_usage": self.codebook_usage.result(),
+            "codebook_perplexity": self.codebook_perplexity.result(),
             "diffusion_step_acc": tf.exp(-tf.cast(outputs["diffusion_loss"], tf.float32)),
             "code_recon_error": tf.cast(outputs["diffusion_loss"], tf.float32) * 0.1,
         }

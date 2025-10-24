@@ -20,7 +20,7 @@ from typing import Optional
 
 
 class Encodec24k:
-    def __init__(self, device: Optional[str] = None):
+    def __init__(self, device: Optional[str] = None, verbose: bool = False):
         try:
             from transformers import EncodecModel, AutoProcessor  # noqa: F401
             import torch  # noqa: F401
@@ -33,6 +33,7 @@ class Encodec24k:
         import torch
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.verbose = verbose
         self.model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(self.device)
         self.processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
         self.model.eval()
@@ -67,59 +68,14 @@ class Encodec24k:
         """
         import numpy as np
         import soundfile as sf
-        import librosa
-        import torch
 
         y, sr = sf.read(wav_path)
-        if y.ndim == 2:
-            y = y.mean(axis=1)
-        if int(sr) != 24000:
-            try:
-                y = librosa.resample(y, orig_sr=int(sr), target_sr=24000, res_type="soxr_hq")
-            except Exception:
-                y = librosa.resample(y, orig_sr=int(sr), target_sr=24000, res_type="kaiser_best")
-
-        inputs = self.processor(raw_audio=y, sampling_rate=24000, return_tensors="pt")
-        input_values = inputs["input_values"].to(self.device)
-        padding_mask = inputs.get("padding_mask")
-        if padding_mask is not None:
-            padding_mask = padding_mask.to(self.device)
-
-        with torch.no_grad():
-            enc = self.model.encode(input_values, padding_mask=padding_mask)
-            codes = enc.audio_codes  # expected [B, K, T] or [B, T, K]
-        codes = codes[0]
-        cfg = self.info
-
-        # Normalize shape to [T, K]
-        if codes.ndim != 2:
-            codes = codes.view(codes.shape[0], -1)
-        T0, T1 = codes.shape[0], codes.shape[1]
-        K = cfg['num_codebooks'] or min(T0, T1)
-        if T0 == K:
-            codes = codes.transpose(0, 1)  # [K, T] -> [T, K]
-        elif T1 == K:
-            pass  # already [T, K]
-        else:
-            # Heuristic: assume [K, T]
-            if T0 < T1:
-                codes = codes.transpose(0, 1)
-
+        codes, cfg = self._encode_audio_array(y, sr)
         codes_np = codes.detach().cpu().numpy().astype(np.int32)
         return codes_np, cfg
 
-    def encode_path_to_codes_from_array(self, audio_array: "np.ndarray", sr: int) -> "tuple[np.ndarray, dict]":
-        """
-        Encode a numpy audio array into Encodec RVQ code indices.
-
-        Args:
-            audio_array: np.ndarray [T] mono float32 in [-1, 1]
-            sr: sampling rate of audio_array
-
-        Returns:
-            (codes, meta) where codes has shape [T, K] (time, num_codebooks), dtype int32
-            meta includes num_codebooks and codebook_size
-        """
+    def _encode_audio_array(self, audio_array: "np.ndarray", sr: int) -> "tuple[torch.Tensor, dict]":
+        """Shared encoding logic for audio arrays."""
         import numpy as np
         import librosa
         import torch
@@ -159,9 +115,22 @@ class Encodec24k:
             if T0 < T1:
                 codes = codes.transpose(0, 1)
 
-        # Ensure codes are int32 for TensorFlow compatibility
-        codes_np = codes.detach().cpu().numpy().astype(np.int32)
+        return codes, cfg
 
+    def encode_path_to_codes_from_array(self, audio_array: "np.ndarray", sr: int) -> "tuple[np.ndarray, dict]":
+        """
+        Encode a numpy audio array into Encodec RVQ code indices.
+
+        Args:
+            audio_array: np.ndarray [T] mono float32 in [-1, 1]
+            sr: sampling rate of audio_array
+
+        Returns:
+            (codes, meta) where codes has shape [T, K] (time, num_codebooks), dtype int32
+            meta includes num_codebooks and codebook_size
+        """
+        codes, cfg = self._encode_audio_array(audio_array, sr)
+        # Ensure codes are int32 for TensorFlow compatibility
         codes_np = codes.detach().cpu().numpy().astype(np.int32)
         return codes_np, cfg
 
@@ -190,44 +159,26 @@ class Encodec24k:
         elif codes_np.ndim != 3:
             raise ValueError(f"Expected codes with 2 or 3 dims, got shape {codes_np.shape}")
 
-        B, T, K_in = codes_np.shape
+        # Ensure we have the correct shape [B, T, K]
+        B, T, K = codes_np.shape
+
+        if self.verbose:
+            print(f"🔍 Debug decode: input shape {codes_np.shape}, B={B}, T={T}, K={K}")
 
         # to torch: [B, K, T]
         # Build dense tensor on CPU first to avoid any odd sparse pathways, then move to device
         codes_t = torch.from_numpy(codes_np.astype(np.int64, copy=False)).contiguous()
-        if codes_t.dim() != 3:
-            codes_t = codes_t.reshape(B, T, K_in)
-        # Decide whether we need to permute based on which axis looks like K (usually very small)
-        a, c = int(codes_t.shape[1]), int(codes_t.shape[2])
-        # Try config hint
-        k_hint = None
-        try:
-            k_hint = int(self.info.get('num_codebooks')) if self.info.get('num_codebooks') is not None else None
-        except Exception:
-            k_hint = None
-        if k_hint is not None:
-            if a == k_hint and c != k_hint:
-                # Already [B, K, T]
-                pass
-            elif c == k_hint and a != k_hint:
-                # [B, T, K] -> [B, K, T]
-                codes_t = codes_t.permute(0, 2, 1).contiguous()
-            else:
-                # Fall back to smaller-dim heuristic
-                if a <= c:
-                    pass  # [B, K, T]
-                else:
-                    codes_t = codes_t.permute(0, 2, 1).contiguous()
-        else:
-            # No hint: assume smaller of the two is K
-            if a <= c:
-                # [B, K, T] already
-                pass
-            else:
-                # [B, T, K] -> [B, K, T]
-                codes_t = codes_t.permute(0, 2, 1).contiguous()
+        if self.verbose:
+            print(f"🔍 Debug decode: torch tensor shape {codes_t.shape}")
+
+        # Explicitly convert to [B, K, T] format expected by Encodec
+        # codes_t is currently [B, T, K], we need [B, K, T]
+        codes_t = codes_t.permute(0, 2, 1).contiguous()
+
+        if self.verbose:
+            print(f"🔍 Debug decode: final torch shape {codes_t.shape}")
         codes_t = codes_t.to(self.device)
-        scales = torch.ones((B, K_in), dtype=torch.float32, device=self.device)
+        scales = torch.ones((B, K), dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             decoded = self.model.decode(codes_t, audio_scales=scales)
