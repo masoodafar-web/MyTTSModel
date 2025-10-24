@@ -41,8 +41,17 @@ class Encodec24k:
     def info(self):
         cfg = self.model.config
         # Attribute names differ across versions; try common ones
-        num_cq = getattr(cfg, 'num_codebooks', None) or getattr(cfg, 'codebook_count', None)
-        codebook_size = getattr(cfg, 'codebook_size', None) or getattr(cfg, 'codebook_size_codebook', None)
+        num_cq = (
+            getattr(cfg, 'num_codebooks', None)
+            or getattr(cfg, 'codebook_count', None)
+            or getattr(cfg, 'rvq_groups', None)
+            or getattr(cfg, 'nb_codebooks', None)
+        )
+        codebook_size = (
+            getattr(cfg, 'codebook_size', None)
+            or getattr(cfg, 'codebook_size_codebook', None)
+            or getattr(cfg, 'codebook_bins', None)
+        )
         return {
             'num_codebooks': int(num_cq) if num_cq is not None else None,
             'codebook_size': int(codebook_size) if codebook_size is not None else None,
@@ -150,6 +159,9 @@ class Encodec24k:
             if T0 < T1:
                 codes = codes.transpose(0, 1)
 
+        # Ensure codes are int32 for TensorFlow compatibility
+        codes_np = codes.detach().cpu().numpy().astype(np.int32)
+
         codes_np = codes.detach().cpu().numpy().astype(np.int32)
         return codes_np, cfg
 
@@ -166,18 +178,56 @@ class Encodec24k:
         import numpy as np
         import torch
 
-        cfg = self.info
-        K = int(cfg['num_codebooks'])
+        # Prefer inferring K from the provided codes to avoid relying on config
         codes_np = np.asarray(codes)
+        # Normalize shape to [B, T, K]
+        if codes_np.ndim == 1:
+            # Ambiguous; treat as [T] with K=1
+            codes_np = codes_np[:, None]
         if codes_np.ndim == 2:
-            codes_np = codes_np[None, ...]  # [B=1, T, K]
+            # [T, K] → [1, T, K]
+            codes_np = codes_np[None, ...]
+        elif codes_np.ndim != 3:
+            raise ValueError(f"Expected codes with 2 or 3 dims, got shape {codes_np.shape}")
+
         B, T, K_in = codes_np.shape
-        assert K_in == K, f"codes K={K_in} must match model K={K}"
 
         # to torch: [B, K, T]
-        codes_t = torch.from_numpy(codes_np.astype(np.int64)).to(self.device)
-        codes_t = codes_t.permute(0, 2, 1).contiguous()
-        scales = torch.ones((B, K), dtype=torch.float32, device=self.device)
+        # Build dense tensor on CPU first to avoid any odd sparse pathways, then move to device
+        codes_t = torch.from_numpy(codes_np.astype(np.int64, copy=False)).contiguous()
+        if codes_t.dim() != 3:
+            codes_t = codes_t.reshape(B, T, K_in)
+        # Decide whether we need to permute based on which axis looks like K (usually very small)
+        a, c = int(codes_t.shape[1]), int(codes_t.shape[2])
+        # Try config hint
+        k_hint = None
+        try:
+            k_hint = int(self.info.get('num_codebooks')) if self.info.get('num_codebooks') is not None else None
+        except Exception:
+            k_hint = None
+        if k_hint is not None:
+            if a == k_hint and c != k_hint:
+                # Already [B, K, T]
+                pass
+            elif c == k_hint and a != k_hint:
+                # [B, T, K] -> [B, K, T]
+                codes_t = codes_t.permute(0, 2, 1).contiguous()
+            else:
+                # Fall back to smaller-dim heuristic
+                if a <= c:
+                    pass  # [B, K, T]
+                else:
+                    codes_t = codes_t.permute(0, 2, 1).contiguous()
+        else:
+            # No hint: assume smaller of the two is K
+            if a <= c:
+                # [B, K, T] already
+                pass
+            else:
+                # [B, T, K] -> [B, K, T]
+                codes_t = codes_t.permute(0, 2, 1).contiguous()
+        codes_t = codes_t.to(self.device)
+        scales = torch.ones((B, K_in), dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             decoded = self.model.decode(codes_t, audio_scales=scales)
@@ -211,7 +261,11 @@ class Encodec24k:
 
         # Resample to 24k
         if int(input_sr) != 24000:
-            wav_24k = librosa.resample(wav, orig_sr=int(input_sr), target_sr=24000, res_type="soxr_hq")
+            try:
+                wav_24k = librosa.resample(wav, orig_sr=int(input_sr), target_sr=24000, res_type="soxr_hq")
+            except Exception:
+                # Fallback to basic resampling
+                wav_24k = librosa.resample(wav, orig_sr=int(input_sr), target_sr=24000, res_type="linear")
         else:
             wav_24k = wav
 
