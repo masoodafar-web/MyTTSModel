@@ -126,12 +126,12 @@ class TrainingConfig:
     use_phoneme_pos_encoding: bool = True  # Use standard positional encoding
 
     # Training
-    batch_size: int = 8
+    batch_size: int = 16
     epochs: int = 50
     validation_split: float = 0.02
 
     # Model
-    model_preset: str = "normal"
+    model_preset: str = "modern_large"
     use_tortoise: bool = False  # Set to True for Tortoise-style diffusion model
     checkpoint_path: str = "checkpoints/tts_core_last.weights.h5"
 
@@ -1317,7 +1317,8 @@ def create_optimizer_and_learner(config: TrainingConfig, model, strategy):
         # Create unified diffusion learner
         learner = EncodecDiffusionLearner(
             model,
-            loss_weights={"diffusion": 1.0}
+            loss_weights={"diffusion": 1.0},
+            tokenizer=tokenizer  # Pass tokenizer to learner
         )
 
         # Compile with appropriate settings
@@ -1347,9 +1348,10 @@ class EncodecDiffusionLearner(tf.keras.Model):
     Handles diffusion training on discrete Encodec codes.
     """
 
-    def __init__(self, model, loss_weights=None):
+    def __init__(self, model, loss_weights=None, tokenizer=None):
         super().__init__()
         self.core = model
+        self.tokenizer = tokenizer  # Add tokenizer reference
         self.loss_weights = loss_weights or {"diffusion": 1.0}
 
         # Metrics
@@ -1627,12 +1629,14 @@ class EncodecDiffusionSampleGenerationCallback(tf.keras.callbacks.Callback):
                     codes_np = generated_codes.numpy()
                     if codes_np.ndim == 3 and codes_np.shape[0] == 1:
                         codes_np = codes_np[0]  # Remove batch dimension
+                    print(f"   🔍 Debug: codes shape = {codes_np.shape}, dtype = {codes_np.dtype}")
                     wav = codec.decode_codes_to_audio(codes_np)  # [T, K] -> [1, N, 1]
                     wav_path = f"{self.samples_dir}/encodec_diffusion_sample_{i}_step_{self.step_count}.wav"
                     sf.write(wav_path, wav[0, :, 0], 24000)
                     print(f"   🎵 Wrote {wav_path}")
                 except Exception as de:
                     print(f"   ⚠️ Could not decode to audio (saving codes only): {de}")
+                    print(f"   🔍 Debug: generated_codes shape = {generated_codes.shape}, dtype = {generated_codes.dtype}")
 
                 print(f"   ✅ EncodecDiffusion sample {i}: '{text[:30]}...' → {generated_codes.shape[1]} frames")
 
@@ -1728,6 +1732,7 @@ def create_callbacks(config: TrainingConfig):
                             # Ensure codes are in correct shape [T, K]
                             if codes_np.ndim == 3 and codes_np.shape[0] == 1:
                                 codes_np = codes_np[0]  # Remove batch dimension
+                            print(f"   🔍 Debug: final codes shape = {codes_np.shape}, dtype = {codes_np.dtype}")
                             audio_waveform = codec.decode_codes_to_audio(codes_np)  # [T, K] -> [1, N, 1]
 
                             if audio_waveform is not None:
