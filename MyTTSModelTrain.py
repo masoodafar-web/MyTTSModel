@@ -452,7 +452,7 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
     """Create and initialize the TTS model."""
     print("🔄 Creating TTS model...")
 
-    from MyTTSModel import TransformerTTS, TortoiseDiffusionTTS
+    # Import presets (model classes are imported conditionally below)
     from TTSConfig import get_model_preset
 
     # Get model configuration
@@ -465,7 +465,10 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
     print(f"   - Dropout rate: {model_config.dropout_rate}")
 
     with strategy.scope():
-        if config.use_tortoise or str(config.objective).lower() == 'tortoise':
+        is_tortoise = (config.use_tortoise or str(config.objective).lower() == 'tortoise')
+        if is_tortoise:
+            # Import only the diffusion model to avoid failing when TransformerTTS is absent
+            from MyTTSModel import TortoiseDiffusionTTS
             print("🐢 Using Tortoise-style diffusion model")
             model = TortoiseDiffusionTTS(
                 num_layers=model_config.num_layers,
@@ -481,6 +484,15 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
                 name="TortoiseDiffusionTTS"
             )
         else:
+            # TransformerTTS is optional in this repo; import only when needed
+            try:
+                from MyTTSModel import TransformerTTS
+            except ImportError as e:
+                raise ImportError(
+                    "TransformerTTS is not available in MyTTSModel.py. "
+                    "Set USE_TORTOISE=1 or TTS_OBJECTIVE=tortoise to use the diffusion model, "
+                    "or implement TransformerTTS."
+                ) from e
             target_type = 'codes' if str(config.objective).lower() == 'encodec' else 'mel'
             model = TransformerTTS(
                 num_layers=model_config.num_layers,
@@ -503,8 +515,8 @@ def create_model(config: TrainingConfig, data_split, strategy, tokenizer, text_c
                 codebook_size=data_split.get('codebook_size')
             )
 
-        # Build model with actual input shapes (for TransformerTTS)
-        if not isinstance(model, TortoiseDiffusionTTS):
+        # Build model with actual input shapes (for TransformerTTS only)
+        if not is_tortoise:
             model.build_for_load(
                 max_src_len=data_split['max_src_len'],
                 max_tgt_len=data_split['max_mel_len']
@@ -653,7 +665,10 @@ class TTSLearner(tf.keras.Model):
         Returns:
             Scalar MAE loss averaged over valid positions
         """
-        mask = tf.cast(mask, y_pred.dtype)
+        # Compute losses in float32 for numeric stability under mixed precision
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        mask = tf.cast(mask, tf.float32)
         absolute_errors = tf.abs(y_pred - y_true)
         numerator = tf.reduce_sum(absolute_errors * mask)
         denominator = tf.reduce_sum(mask) + 1e-8
@@ -667,7 +682,10 @@ class TTSLearner(tf.keras.Model):
         This provides a more interpretable metric by averaging across
         frequency dimensions before applying the temporal mask.
         """
-        mask = tf.cast(mask, y_pred.dtype)
+        # Compute losses in float32 for numeric stability under mixed precision
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        mask = tf.cast(mask, tf.float32)
         absolute_errors = tf.abs(y_pred - y_true)
         # Average across frequency bands (last dimension)
         band_averaged_errors = tf.reduce_mean(absolute_errors, axis=-1, keepdims=True)
@@ -1329,7 +1347,7 @@ class TortoiseDiffusionLearner(tf.keras.Model):
 
 def create_learning_rate_schedule(config: TrainingConfig, data_split, steps_per_epoch):
     """Create Noam learning rate schedule."""
-    from MyTTSModel import TransformerTTS, TortoiseDiffusionTTS
+    from MyTTSModel import TortoiseDiffusionTTS
     from TTSConfig import get_model_preset
 
     model_config = get_model_preset(config.model_preset)
@@ -2053,7 +2071,6 @@ class TensorBoardAudioLogger(tf.keras.callbacks.Callback):
                     audio_np = audio.numpy().astype(np.float32)
                     one_d = audio_np[0, :, 0]
                     audio_24k = self._encodec.reencode_to_24k(one_d, input_sr=int(audio_cfg.target_sample_rate))
-                    import tensorflow as tf
                     return tf.convert_to_tensor(audio_24k, dtype=tf.float32)
                 except Exception as e:
                     print(f"   ⚠️ Encodec re-encode failed (falling back to raw): {e}")

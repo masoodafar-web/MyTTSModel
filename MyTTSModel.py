@@ -3,10 +3,42 @@
 # =========================
 import tensorflow as tf
 from tensorflow.keras import layers
+import numpy as np
 
 class SinusoidalPositionalEncoding(layers.Layer):
     """
-    Sinusoidal positional encoding for diffusion timesteps.
+    Sinusoidal positional encoding for sequences (additive on embeddings).
+    """
+
+    def __init__(self, dim, max_period=10000, name=None):
+        super().__init__(name=name)
+        self.dim = dim
+        self.max_period = max_period
+
+    def call(self, x):
+        # x: (B, S, d_model) - input tensor for positional encoding
+        seq_len = tf.shape(x)[1]
+        positions = tf.range(seq_len, dtype=tf.float32)  # (S,)
+
+        half_dim = self.dim // 2
+        exponents = tf.range(half_dim, dtype=tf.float32) / half_dim
+        freqs = tf.exp(-tf.math.log(float(self.max_period)) * exponents)
+        args = positions[:, None] * freqs[None, :]  # (S, half_dim)
+
+        pos_enc = tf.concat([tf.sin(args), tf.cos(args)], axis=-1)  # (S, dim)
+        pos_enc = tf.expand_dims(pos_enc, axis=0)  # (1, S, dim)
+        pos_enc = tf.cast(pos_enc, x.dtype)  # Match input dtype
+
+        return x + pos_enc
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
+class SinusoidalTimestepEncoding(layers.Layer):
+    """
+    Sinusoidal encoding for diffusion timesteps.
+    Returns a vector per batch element.
     """
 
     def __init__(self, dim, max_period=10000, name=None):
@@ -16,58 +48,92 @@ class SinusoidalPositionalEncoding(layers.Layer):
 
     def call(self, timesteps):
         # timesteps: (B,) or scalar
+        timesteps = tf.reshape(timesteps, [-1])
         half_dim = self.dim // 2
-        exponents = tf.range(half_dim, dtype=tf.float32) / half_dim
-        freqs = tf.exp(-tf.math.log(self.max_period) * exponents)
+        exponents = tf.range(half_dim, dtype=tf.float32) / tf.cast(half_dim, tf.float32)
+        freqs = tf.exp(-tf.math.log(tf.cast(self.max_period, tf.float32)) * exponents)
         args = timesteps[:, None] * freqs[None, :]
         return tf.concat([tf.sin(args), tf.cos(args)], axis=-1)
 
 
-class DiffusionDenoiser(layers.Layer):
+class DiffusionDenoiserUNet(layers.Layer):
     """
-    Diffusion denoiser network for Tortoise-style mel generation.
-    Uses a Transformer decoder conditioned on text and voice latents.
+    U-Net based diffusion denoiser for Tortoise-style mel generation.
+    Similar to the U-Net architecture used in original Tortoise TTS.
     """
 
-    def __init__(self, num_layers, d_model, num_heads, dff, n_mels,
-                 dropout_rate=0.1, max_length=4096, name="diffusion_denoiser"):
+    def __init__(self, n_mels, base_channels=128, channel_mults=[1, 2, 4, 8],
+                 dropout_rate=0.1, name="diffusion_denoiser_unet"):
         super().__init__(name=name)
         self.n_mels = n_mels
-        self.time_embed = SinusoidalPositionalEncoding(d_model)
+        self.channel_mults = channel_mults
+        self.base_channels = base_channels
 
-        # Mel projection (noisy mel input)
-        self.mel_proj = MelPositionalProjection(n_mels, d_model, max_length=max_length, name="mel_proj")
+        # Time embedding for diffusion timesteps
+        self.time_embed = SinusoidalTimestepEncoding(base_channels * 4)
+        self.time_proj = layers.Dense(base_channels * 4, activation="silu", name="time_proj")
 
-        # Time embedding projection
-        self.time_proj = layers.Dense(d_model, name="time_proj")
+        # Input projection
+        self.input_proj = layers.Conv1D(base_channels, 3, padding="same", name="input_proj")
 
-        # Voice latent conditioning (from autoencoder)
-        self.voice_proj = layers.Dense(d_model, name="voice_proj")
+        # Encoder blocks (downsampling)
+        self.encoder_blocks = []
+        self.downsample_blocks = []
+        channels = base_channels
+        for i, mult in enumerate(channel_mults):
+            # Residual blocks
+            self.encoder_blocks.append([
+                ResBlock(channels, dropout_rate, name=f"enc_res_{i}_0"),
+                ResBlock(channels, dropout_rate, name=f"enc_res_{i}_1"),
+            ])
 
-        # Cross-attention layers for text and voice conditioning
-        self.cross_attn_text = BaseAttentionPreNorm(
-            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, name="cross_attn_text"
-        )
-        self.cross_attn_voice = BaseAttentionPreNorm(
-            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, name="cross_attn_voice"
-        )
+            # Downsampling (except last)
+            if i < len(channel_mults) - 1:
+                self.downsample_blocks.append(
+                    layers.Conv1D(channels * 2, 4, strides=2, padding="same", name=f"down_{i}")
+                )
+                channels *= 2
 
-        # Decoder layers
-        self.layers_ = []
-        for i in range(num_layers):
-            dp = 0.0 if dropout_rate == 0.0 else dropout_rate * (i / max(1, num_layers - 1))
-            self.layers_.append(
-                DecoderLayer(d_model=d_model, num_heads=num_heads, dff=dff,
-                            dropout_rate=dropout_rate, droppath=dp, name=f"dec_layer_{i}")
+        # Middle block
+        self.middle_block = [
+            ResBlock(channels, dropout_rate, name="mid_res_0"),
+            ResBlock(channels, dropout_rate, name="mid_res_1"),
+        ]
+
+        # Decoder blocks (upsampling)
+        self.decoder_blocks = []
+        self.upsample_blocks = []
+        self.skip_connections = []
+        for i, mult in enumerate(reversed(channel_mults)):
+            # Skip connection projection
+            skip_channels = base_channels * mult
+            self.skip_connections.append(
+                layers.Conv1D(channels, 1, name=f"skip_proj_{i}")
             )
 
-        self.dropout = layers.Dropout(dropout_rate)
-        self.final_norm = layers.LayerNormalization(epsilon=1e-5, name="final_norm")
-        self.output_proj = layers.Dense(n_mels, name="output_proj")
+            # Residual blocks
+            self.decoder_blocks.append([
+                ResBlock(channels, dropout_rate, name=f"dec_res_{i}_0"),
+                ResBlock(channels, dropout_rate, name=f"dec_res_{i}_1"),
+            ])
+
+            # Upsampling (except last)
+            if i < len(channel_mults) - 1:
+                self.upsample_blocks.append(
+                    layers.Conv1DTranspose(channels // 2, 4, strides=2, padding="same", name=f"up_{i}")
+                )
+                channels //= 2
+
+        # Output projection
+        self.output_proj = layers.Conv1D(n_mels, 3, padding="same", name="output_proj")
+
+        # Conditioning projections
+        self.text_conditioning = layers.Dense(base_channels, name="text_cond")
+        self.voice_conditioning = layers.Dense(base_channels, name="voice_cond")
 
     def call(self, noisy_mel, timesteps, text_context, voice_latents, training=False):
         """
-        Denoise mel-spectrogram conditioned on text and voice.
+        U-Net forward pass for denoising.
 
         Args:
             noisy_mel: (B, T, n_mels) - Noisy mel input
@@ -80,33 +146,106 @@ class DiffusionDenoiser(layers.Layer):
             (B, T, n_mels) - Denoised mel prediction
         """
         # Time embedding
-        t_emb = self.time_embed(timesteps)  # (B, D)
-        t_emb = self.time_proj(t_emb)  # (B, D)
+        t_emb = self.time_embed(timesteps)  # (B, base_channels*4)
+        t_emb = self.time_proj(t_emb)  # (B, base_channels*4)
 
-        # Mel projection
-        x = self.mel_proj(noisy_mel)  # (B, T, D)
+        # Conditioning
+        text_cond = self.text_conditioning(text_context)  # (B, S, base_channels)
+        voice_cond = self.voice_conditioning(voice_latents)  # (B, L, base_channels)
 
-        # Add time embedding to mel
-        x = x + t_emb[:, None, :]  # Broadcast to (B, T, D)
+        # Input projection
+        x = self.input_proj(noisy_mel)  # (B, T, base_channels)
+        x = tf.nn.silu(x)
 
-        # Voice conditioning projection
-        voice_cond = self.voice_proj(voice_latents)  # (B, L, D)
+        # Encoder path with skip connections
+        skips = []
+        for i, (res_blocks, downsample) in enumerate(zip(self.encoder_blocks, self.downsample_blocks + [None])):
+            # Apply conditioning
+            if i == 0:
+                # Add text conditioning to first encoder block
+                text_cond_avg = tf.reduce_mean(text_cond, axis=1, keepdims=True)  # (B, 1, base_channels)
+                x = x + text_cond_avg
 
-        # Cross-attention with text
-        x = self.cross_attn_text(x, context=text_context, training=training)
+            for res_block in res_blocks:
+                x = res_block(x, t_emb, training=training)
 
-        # Cross-attention with voice
-        x = self.cross_attn_voice(x, context=voice_cond, training=training)
+            skips.append(x)
 
-        # Decoder layers (self-attention)
-        T = tf.shape(x)[1]
-        causal_mask = combine_causal_and_keypadding(tf.ones((tf.shape(x)[0], T), dtype=tf.bool))
-        for layer in self.layers_:
-            x = layer(x, context=x, dec_causal_key_mask=causal_mask, training=training)
+            if downsample is not None:
+                x = downsample(x)
+                x = tf.nn.silu(x)
 
-        x = self.final_norm(x)
-        x = self.dropout(x, training=training)
-        return self.output_proj(x)  # (B, T, n_mels)
+        # Middle
+        for res_block in self.middle_block:
+            x = res_block(x, t_emb, training=training)
+
+        # Decoder path
+        for i, (res_blocks, upsample) in enumerate(zip(self.decoder_blocks, self.upsample_blocks + [None])):
+            if upsample is not None:
+                x = upsample(x)
+                x = tf.nn.silu(x)
+
+            # Skip connection
+            skip = self.skip_connections[i](skips[-(i+1)])
+            x = tf.concat([x, skip], axis=-1)
+
+            # Apply conditioning
+            if i == len(self.decoder_blocks) - 1:
+                # Add voice conditioning to last decoder block
+                voice_cond_avg = tf.reduce_mean(voice_cond, axis=1, keepdims=True)  # (B, 1, base_channels)
+                x = x + voice_cond_avg
+
+            for res_block in res_blocks:
+                x = res_block(x, t_emb, training=training)
+
+        # Output
+        return self.output_proj(x)
+
+
+class ResBlock(layers.Layer):
+    """
+    Residual block for U-Net with time conditioning.
+    """
+
+    def __init__(self, channels, dropout_rate=0.1, name=None):
+        super().__init__(name=name)
+        self.channels = channels
+
+        self.norm1 = layers.GroupNormalization(groups=min(32, channels), name="norm1")
+        self.conv1 = layers.Conv1D(channels, 3, padding="same", name="conv1")
+
+        self.norm2 = layers.GroupNormalization(groups=min(32, channels), name="norm2")
+        self.conv2 = layers.Conv1D(channels, 3, padding="same", name="conv2")
+
+        self.time_proj = layers.Dense(channels, name="time_proj")
+
+        self.dropout = layers.Dropout(dropout_rate, name="dropout")
+        self.residual_conv = layers.Conv1D(channels, 1, name="residual_conv") if channels != channels else None
+
+    def call(self, x, time_emb, training=False):
+        """
+        Args:
+            x: (B, T, C) - Input features
+            time_emb: (B, C) - Time embedding
+            training: bool
+        """
+        h = self.norm1(x)
+        h = tf.nn.silu(h)
+        h = self.conv1(h)
+
+        # Add time embedding
+        time_emb_proj = self.time_proj(time_emb)  # (B, C)
+        h = h + time_emb_proj[:, None, :]  # Broadcast to (B, T, C)
+
+        h = self.norm2(h)
+        h = tf.nn.silu(h)
+        h = self.dropout(h, training=training)
+        h = self.conv2(h)
+
+        # Residual connection
+        if self.residual_conv is not None:
+            x = self.residual_conv(x)
+        return x + h
 
 
 class VoiceAutoencoder(tf.keras.Model):
@@ -154,10 +293,18 @@ class TortoiseDiffusionTTS(tf.keras.Model):
         self.n_mels = n_mels
         self.num_timesteps = num_timesteps
 
-        # Text encoder (shared with original)
-        self.text_encoder = Encoder(num_layers=num_layers, d_model=d_model,
-                                   num_heads=num_heads, dff=dff,
-                                   vocab_size=input_vocab_size, name="text_encoder")
+        # Text encoder (simplified transformer encoder)
+        self.text_encoder = tf.keras.Sequential([
+            layers.Embedding(input_vocab_size, d_model),
+            layers.LayerNormalization(epsilon=1e-5),
+            *[tf.keras.Sequential([
+                layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads),
+                layers.LayerNormalization(epsilon=1e-5),
+                layers.Dense(dff, activation="gelu"),
+                layers.Dense(d_model),
+                layers.LayerNormalization(epsilon=1e-5),
+            ]) for _ in range(num_layers)],
+        ], name="text_encoder")
 
         # Voice autoencoder for conditioning
         self.voice_autoencoder = VoiceAutoencoder(latent_dim=latent_dim, n_mels=n_mels)
@@ -167,9 +314,10 @@ class TortoiseDiffusionTTS(tf.keras.Model):
             num_quantizers=4, num_embeddings=1024, embedding_dim=n_mels
         )
 
-        # Diffusion denoiser
-        self.denoiser = DiffusionDenoiser(
-            num_layers=num_layers, d_model=d_model, num_heads=num_heads, dff=dff, n_mels=n_mels
+        # Diffusion denoiser (U-Net based like Tortoise)
+        self.denoiser = DiffusionDenoiserUNet(
+            n_mels=n_mels, base_channels=d_model // 4,  # Adjust based on d_model
+            channel_mults=[1, 2, 4, 8], dropout_rate=0.1
         )
 
         # Diffusion schedule (DDPM)
@@ -220,9 +368,7 @@ class TortoiseDiffusionTTS(tf.keras.Model):
         voice_mel = inputs.get("voice_mel", mel_target)  # For conditioning
 
         # Encode text
-        text_valid = make_padding_bool(text_ids, self.text_encoder.pos_embedding.embedding.vocab_size - 1)
-        text_key_mask = key_mask_from_valid(text_valid)
-        text_context = self.text_encoder(text_ids, key_mask=text_key_mask, q_valid=text_valid, training=training)
+        text_context = self.text_encoder(text_ids, training=training)
 
         # Voice conditioning
         _, voice_latents = self.voice_autoencoder(voice_mel, training=training)
@@ -264,9 +410,7 @@ class TortoiseDiffusionTTS(tf.keras.Model):
         T = 200  # Target mel length (can be adjusted)
 
         # Encode text and voice
-        text_valid = make_padding_bool(text_ids, self.text_encoder.pos_embedding.embedding.vocab_size - 1)
-        text_key_mask = key_mask_from_valid(text_valid)
-        text_context = self.text_encoder(text_ids, key_mask=text_key_mask, q_valid=text_valid, training=False)
+        text_context = self.text_encoder(text_ids, training=False)
 
         _, voice_latents = self.voice_autoencoder(voice_mel, training=False)
 
@@ -373,6 +517,435 @@ class TortoiseDiffusionTTS(tf.keras.Model):
             S, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
         )
         return tf.cast(wav_final, tf.float32)
+# =========================
+# Transformer TTS Model
+# =========================
+import tensorflow as tf
+from tensorflow.keras import layers
+import numpy as np
+
+
+class TransformerTTS(tf.keras.Model):
+    """
+    Transformer-based Text-to-Speech model similar to FastSpeech/Tacotron 2.
+
+    This implementation includes:
+    - Transformer encoder for text processing
+    - Duration predictor for length regulation
+    - Decoder with prenet and postnet
+    - Stop token prediction
+    """
+
+    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, n_mels,
+                 dropout_rate=0.1, pad_id=0, use_prenet=True, prenet_drop=0.5,
+                 droppath_rate=0.0, cross_win=None, enable_postnet=True,
+                 activation='gelu', pos_encoding_type='sinusoidal',
+                 target_type='mel', num_codebooks=None, codebook_size=None, **kwargs):
+        super().__init__(**kwargs)
+
+        self.pad_id = pad_id
+        self.n_mels = n_mels
+        self.target_type = target_type
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+
+        # Output dimensions based on target type
+        if target_type == 'codes':
+            self.output_dim = num_codebooks * codebook_size
+        else:
+            self.output_dim = n_mels
+
+        # Encoder
+        self.encoder_embedding = layers.Embedding(input_vocab_size, d_model)
+        if pos_encoding_type == 'sinusoidal':
+            self.encoder_pos_encoding = SinusoidalPositionalEncoding(d_model)
+        else:
+            self.encoder_pos_encoding = LearnedPositionalEncoding(d_model)
+
+        self.encoder_layers = []
+        for i in range(num_layers):
+            self.encoder_layers.append(
+                TransformerBlock(d_model, num_heads, dff, dropout_rate, activation)
+            )
+
+        # Duration predictor (for length regulation)
+        self.duration_predictor = DurationPredictor(d_model, dropout_rate)
+
+        # Decoder prenet
+        if use_prenet:
+            self.prenet = PreNet(self.output_dim, prenet_drop)
+        else:
+            self.prenet = None
+
+        # Decoder
+        self.decoder_embedding = LinearEmbedding(self.output_dim, d_model)
+        if pos_encoding_type == 'sinusoidal':
+            self.decoder_pos_encoding = SinusoidalPositionalEncoding(d_model)
+        else:
+            self.decoder_pos_encoding = LearnedPositionalEncoding(d_model)
+
+        self.decoder_layers = []
+        for i in range(num_layers):
+            self.decoder_layers.append(
+                TransformerBlock(d_model, num_heads, dff, dropout_rate, activation)
+            )
+
+        # Output projections
+        self.mel_pre_projection = layers.Dense(self.output_dim)
+        self.stop_projection = layers.Dense(1)
+
+        # Postnet
+        if enable_postnet:
+            self.postnet = PostNet(self.output_dim, dropout_rate)
+        else:
+            self.postnet = None
+
+        # Length regulator
+        self.length_regulator = LengthRegulator()
+
+    def build_for_load(self, max_src_len, max_tgt_len):
+        """Build model by running a dummy forward pass on symbolic inputs.
+
+        This ensures variables are created and `self.built` is set without
+        baking in fixed batch dimensions from masks.
+        """
+        enc_ids_in = tf.keras.Input(shape=(max_src_len,), dtype=tf.int32, name='enc_ids')
+        dec_mel_in = tf.keras.Input(shape=(max_tgt_len, self.output_dim), dtype=tf.float32, name='dec_mel')
+        mel_len_in = tf.keras.Input(shape=(), dtype=tf.int32, name='mel_len')
+
+        _ = self({
+            'enc_ids': enc_ids_in,
+            'dec_mel': dec_mel_in,
+            'mel_len': mel_len_in,
+        }, training=False)
+
+        # Mark as built for Keras bookkeeping
+        self.built = True
+        print(f"✅ Model built with max_src_len={max_src_len}, max_tgt_len={max_tgt_len}")
+
+    def call_encoder(self, src_ids, src_mask, training=False):
+        """Encoder forward pass."""
+        # Embedding + positional encoding
+        x = self.encoder_embedding(src_ids)  # (B, S, d_model)
+        x = tf.cast(x, tf.float32)  # Ensure consistent dtype
+        x = x * tf.sqrt(tf.cast(self.encoder_embedding.output_dim, tf.float32))
+        x = self.encoder_pos_encoding(x)
+
+        # Encoder layers
+        for layer in self.encoder_layers:
+            x = layer(x, mask=src_mask, training=training)
+
+        return x  # (B, S, d_model)
+
+    def call_decoder(self, tgt_mel, tgt_mask, encoder_output, training=False):
+        """Decoder forward pass."""
+        # Prenet
+        if self.prenet is not None:
+            x = self.prenet(tgt_mel, training=training)  # (B, T, prenet_dim)
+            x = self.decoder_embedding(x)  # (B, T, d_model)
+        else:
+            x = self.decoder_embedding(tgt_mel)  # (B, T, d_model)
+
+        # Positional encoding
+        x = self.decoder_pos_encoding(x)
+
+        # Decoder layers (simplified - no cross-attention for this basic version)
+        for layer in self.decoder_layers:
+            x = layer(x, mask=tgt_mask, training=training)
+
+        return x  # (B, T, d_model)
+
+    def call(self, inputs, training=False, return_attn=False):
+        """
+        Full forward pass for training.
+
+        Args:
+            inputs: Dict with 'enc_ids', 'dec_mel', 'mel_len', etc.
+            training: Training mode
+            return_attn: Whether to return attention weights
+
+        Returns:
+            mel_pre, mel_post, stop_logits, [attention]
+        """
+        enc_ids = inputs['enc_ids']  # (B, S)
+        dec_mel = inputs['dec_mel']  # (B, T, n_mels)
+        mel_len = inputs.get('mel_len', None)  # (B,)
+
+        # Ensure consistent dtypes for mixed precision
+        enc_ids = tf.cast(enc_ids, tf.int32)
+        dec_mel = tf.cast(dec_mel, tf.float32)
+        if mel_len is not None:
+            mel_len = tf.cast(mel_len, tf.int32)
+
+        # Create masks
+        batch_size = tf.shape(enc_ids)[0]
+        src_len = tf.shape(enc_ids)[1]
+        tgt_len = tf.shape(dec_mel)[1]
+
+        # Source self-attention mask (B, S, S): allow attention only to valid tokens
+        src_valid = enc_ids != self.pad_id                        # (B, S)
+        src_mask = tf.logical_and(src_valid[:, None, :],          # (B, 1, S)
+                                  src_valid[:, :, None])         # (B, S, 1)
+
+        # Target mask (causal + padding)
+        if mel_len is not None:
+            tgt_padding_mask = tf.sequence_mask(mel_len, maxlen=tgt_len, dtype=tf.bool)  # (B, T)
+        else:
+            tgt_padding_mask = tf.ones((batch_size, tgt_len), dtype=tf.bool)
+        causal_mask = tf.linalg.band_part(tf.ones((tgt_len, tgt_len), dtype=tf.bool), -1, 0)  # (T, T)
+        tgt_mask = tf.logical_and(tgt_padding_mask[:, :, None], causal_mask[None, :, :])  # (B, T, T)
+
+        # Encoder
+        encoder_output = self.call_encoder(enc_ids, src_mask, training=training)
+
+        # Decoder
+        decoder_output = self.call_decoder(dec_mel, tgt_mask, encoder_output, training=training)
+
+        # Output projections
+        mel_pre = self.mel_pre_projection(decoder_output)  # (B, T, output_dim)
+
+        # Stop token prediction
+        stop_logits = self.stop_projection(decoder_output)  # (B, T, 1)
+
+        # Postnet
+        if self.postnet is not None:
+            mel_residual = self.postnet(mel_pre, training=training)
+            mel_post = mel_pre + mel_residual
+        else:
+            mel_post = mel_pre
+
+        if return_attn:
+            # Return dummy attention for compatibility
+            attention = tf.zeros((batch_size, tgt_len, src_len), dtype=tf.float32)
+            return mel_pre, mel_post, stop_logits, attention
+        else:
+            return mel_pre, mel_post, stop_logits
+
+    def greedy_generate_fast(self, input_ids, max_steps=1000, min_steps=10, stop_threshold=0.5, verbose=False):
+        """
+        Fast greedy decoding for inference.
+
+        Args:
+            input_ids: (B, S) input token IDs
+            max_steps: Maximum decoding steps
+            min_steps: Minimum decoding steps
+            stop_threshold: Stop token threshold
+            verbose: Whether to print progress
+
+        Returns:
+            mel_output: (B, T, n_mels) generated mel
+            stop_probs: (B, T) stop probabilities
+        """
+        batch_size = tf.shape(input_ids)[0]
+
+        # Encoder
+        src_valid = input_ids != self.pad_id
+        src_mask = tf.logical_and(src_valid[:, None, :], src_valid[:, :, None])
+        encoder_output = self.call_encoder(input_ids, src_mask, training=False)
+
+        # Initialize decoder input (start with zeros)
+        mel_output = []
+        stop_probs = []
+
+        # Start with a zero frame
+        current_mel = tf.zeros((batch_size, 1, self.output_dim), dtype=tf.float32)
+
+        for step in range(max_steps):
+            # Decoder input (teacher forcing with generated so far)
+            decoder_input = tf.concat(mel_output + [current_mel], axis=1) if mel_output else current_mel
+
+            # Create target mask
+            tgt_len = tf.shape(decoder_input)[1]
+            causal_mask = tf.linalg.band_part(tf.ones((tgt_len, tgt_len), dtype=tf.bool), -1, 0)
+            tgt_mask = tf.broadcast_to(causal_mask[None, :, :], (batch_size, tgt_len, tgt_len))
+
+            # Decoder forward pass
+            decoder_out = self.call_decoder(decoder_input, tgt_mask, encoder_output, training=False)
+
+            # Get last frame predictions
+            last_frame = decoder_out[:, -1:, :]  # (B, 1, d_model)
+            mel_pred = self.mel_pre_projection(last_frame)  # (B, 1, output_dim)
+            stop_logit = self.stop_projection(last_frame)  # (B, 1, 1)
+            stop_prob = tf.sigmoid(stop_logit)  # (B, 1, 1)
+
+            # Store predictions
+            mel_output.append(mel_pred)
+            stop_probs.append(tf.squeeze(stop_prob, axis=-1))
+
+            # Check stop condition
+            if step >= min_steps and tf.reduce_mean(stop_prob) > stop_threshold:
+                if verbose:
+                    print(f"Stopping at step {step} with stop prob {tf.reduce_mean(stop_prob).numpy():.3f}")
+                break
+
+            # Update current mel for next step
+            current_mel = mel_pred
+
+        # Concatenate outputs
+        if mel_output:
+            mel_output = tf.concat(mel_output, axis=1)  # (B, T, output_dim)
+            stop_probs = tf.concat(stop_probs, axis=1)  # (B, T)
+        else:
+            mel_output = tf.zeros((batch_size, 0, self.output_dim), dtype=tf.float32)
+            stop_probs = tf.zeros((batch_size, 0), dtype=tf.float32)
+
+        return mel_output, stop_probs
+
+
+class TransformerBlock(layers.Layer):
+    """Transformer encoder/decoder block."""
+
+    def __init__(self, d_model, num_heads, dff, dropout_rate=0.1, activation='gelu'):
+        super().__init__()
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads)
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(dff, activation=activation),
+            layers.Dense(d_model)
+        ])
+
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+
+        self.dropout1 = layers.Dropout(dropout_rate)
+        self.dropout2 = layers.Dropout(dropout_rate)
+
+    def call(self, x, mask=None, training=False):
+        # Multi-head attention
+        if mask is not None:
+            # Convert mask to attention_mask format expected by MHA
+            # MHA expects (B, num_heads, T, T) or (B, T, T)
+            if len(mask.shape) == 3:
+                # (B, T, T) - this should work directly with MHA
+                attn_output = self.mha(x, x, attention_mask=mask, training=training)
+            else:
+                # Handle other formats
+                attn_output = self.mha(x, x, attention_mask=mask, training=training)
+        else:
+            attn_output = self.mha(x, x, training=training)
+
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(x + attn_output)
+
+        # Feed forward
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = self.layernorm2(out1 + ffn_output)
+
+        return out2
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
+class PreNet(layers.Layer):
+    """Decoder prenet."""
+
+    def __init__(self, input_dim, dropout_rate=0.5):
+        super().__init__()
+        self.layers = [
+            layers.Dense(256, activation='relu'),
+            layers.Dropout(dropout_rate),
+            layers.Dense(256, activation='relu'),
+            layers.Dropout(dropout_rate)
+        ]
+
+    def call(self, x, training=False):
+        for layer in self.layers:
+            x = layer(x, training=training)
+        return x
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[1], 256)
+
+
+class PostNet(layers.Layer):
+    """Mel postnet for residual refinement."""
+
+    def __init__(self, mel_dim, dropout_rate=0.1):
+        super().__init__()
+        self.convs = []
+        for i in range(5):
+            in_channels = mel_dim if i == 0 else 512
+            out_channels = mel_dim if i == 4 else 512
+            self.convs.append(layers.Conv1D(out_channels, 5, padding='same', activation='tanh'))
+            self.convs.append(layers.BatchNormalization())
+            self.convs.append(layers.Dropout(dropout_rate))
+
+    def call(self, x, training=False):
+        # x: (B, T, mel_dim)
+        for layer in self.convs:
+            x = layer(x, training=training)
+        return x
+
+
+class DurationPredictor(layers.Layer):
+    """Duration predictor for length regulation."""
+
+    def __init__(self, d_model, dropout_rate=0.1):
+        super().__init__()
+        self.convs = [
+            layers.Conv1D(256, 3, padding='same', activation='relu'),
+            layers.Conv1D(256, 3, padding='same', activation='relu'),
+            layers.Conv1D(256, 3, padding='same', activation='relu')
+        ]
+        self.linear = layers.Dense(1)
+        self.dropout = layers.Dropout(dropout_rate)
+
+    def call(self, x, training=False):
+        for conv in self.convs:
+            x = conv(x)
+            x = self.dropout(x, training=training)
+        x = self.linear(x)
+        return x
+
+
+class LengthRegulator(layers.Layer):
+    """Length regulator to expand phonemes to frames."""
+
+    def call(self, encoder_output, durations):
+        """Expand encoder output based on predicted durations."""
+        # Simple implementation - repeat each frame by duration
+        batch_size = tf.shape(encoder_output)[0]
+        expanded = []
+
+        for b in range(batch_size):
+            seq_expanded = []
+            for t in range(tf.shape(encoder_output)[1]):
+                duration = tf.maximum(tf.cast(durations[b, t], tf.int32), 1)
+                repeated = tf.tile([encoder_output[b, t]], [duration, 1])
+                seq_expanded.append(repeated)
+            expanded.append(tf.concat(seq_expanded, axis=0))
+
+        return tf.stack(expanded, axis=0)
+
+
+class LearnedPositionalEncoding(layers.Layer):
+    """Learned positional encoding."""
+
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.pos_embedding = self.add_weight(
+            name="pos_embedding",
+            shape=(max_len, d_model),
+            initializer="uniform"
+        )
+
+    def call(self, x):
+        seq_len = tf.shape(x)[1]
+        return x + self.pos_embedding[:seq_len]
+
+
+class LinearEmbedding(layers.Layer):
+    """Linear embedding for decoder input."""
+
+    def __init__(self, input_dim, d_model):
+        super().__init__()
+        self.linear = layers.Dense(d_model)
+
+    def call(self, x):
+        return self.linear(x)
+
+
 # =========================
 # RVQ (Residual Vector Quantization)
 # =========================
