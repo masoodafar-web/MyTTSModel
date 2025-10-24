@@ -38,6 +38,15 @@ from transformers import AutoTokenizer
 # برای مسیر آفلاین:
 import librosa
 import soundfile as sf
+from typing import Any
+
+# Optional: Encodec integration (loaded lazily)
+def _load_encodec():
+    try:
+        from codec.encodec_codec import Encodec24k  # noqa: F401
+        return Encodec24k
+    except Exception as e:
+        raise ImportError("Encodec integration requires transformers and torch. Install them to use encodec objective.") from e
 
 # =========================================================
 # Config
@@ -601,6 +610,22 @@ def _mel_cache_path(cache_dir: str, wav_path: str, cfg: AudioCfg) -> str:
     os.makedirs(sub, exist_ok=True)
     return os.path.join(sub, f"{key}.npy")
 
+# ====== Encodec codes cache ======
+def _codes_cache_key(wav_path: str, model_id: str = "facebook/encodec_24khz") -> str:
+    try:
+        st = os.stat(wav_path)
+        sig = f"{wav_path}|{st.st_size}|{st.st_mtime}|{model_id}"
+    except FileNotFoundError:
+        sig = f"{wav_path}|missing|{model_id}"
+    h = hashlib.sha1(sig.encode("utf-8")).hexdigest()
+    return h
+
+def _codes_cache_path(cache_dir: str, wav_path: str, model_id: str = "facebook/encodec_24khz") -> str:
+    key = _codes_cache_key(wav_path, model_id)
+    sub = os.path.join(cache_dir, "codes", key[:2], key[2:4])
+    os.makedirs(sub, exist_ok=True)
+    return os.path.join(sub, f"{key}.npz")
+
 def _load_or_compute_mel_cached(wav_path: str, cfg: AudioCfg, cache_dir: Optional[str]):
     if cache_dir:
         path = _mel_cache_path(cache_dir, wav_path, cfg)
@@ -709,6 +734,101 @@ def preprocess_dataset(
             pass
 
     return items, text_ids, mels, np.asarray(mel_lens, dtype=np.int32)
+
+# =========================================================
+# Encodec objective: offline preprocessing to codes
+# =========================================================
+def _load_or_compute_codes_cached(wav_path: str, cache_dir: str, model_id: str = "facebook/encodec_24khz"):
+    if cache_dir:
+        p = _codes_cache_path(cache_dir, wav_path, model_id)
+        if os.path.exists(p):
+            try:
+                z = np.load(p, allow_pickle=True)
+                codes = z["codes"]
+                info = {
+                    "num_codebooks": int(z["num_codebooks"]),
+                    "codebook_size": int(z["codebook_size"]),
+                }
+                return codes.astype(np.int32), codes.shape[0], info, True
+            except Exception:
+                pass
+    # Compute
+    Encodec24k = _load_encodec()
+    codec = Encodec24k()
+    codes, info = codec.encode_path_to_codes(wav_path)
+    if cache_dir:
+        outp = _codes_cache_path(cache_dir, wav_path, model_id)
+        try:
+            np.savez_compressed(outp, codes=codes.astype(np.int16), num_codebooks=info["num_codebooks"], codebook_size=info["codebook_size"])  # small size
+        except Exception:
+            pass
+    return codes.astype(np.int32), codes.shape[0], info, False
+
+def preprocess_dataset_encodec(
+    root_dir: str,
+    text_cfg: TextCfg,
+    tok,
+    metadata_name: str = "metadata.csv",
+    num_workers: int = None,
+    cache_dir: Optional[str] = None,
+    model_id: str = "facebook/encodec_24khz",
+):
+    """
+    Tokenize text and compute Encodec RVQ codes for each audio file.
+
+    Returns:
+        items, text_ids, codes_list, code_lens, encodec_info
+    """
+    items = load_ljspeech_items(root_dir, metadata_name=metadata_name)
+    text_ids = tokenize_texts(items, tok, text_cfg)
+
+    if num_workers is None:
+        try:
+            hw_threads = os.cpu_count() or 1
+        except Exception:
+            hw_threads = 1
+        num_workers = max(1, hw_threads - 1)
+
+    wav_paths = [wav for (wav, _) in items]
+    codes_list: list[np.ndarray] = []
+    code_lens: list[int] = []
+    info_ref: Optional[Dict[str, Any]] = None
+    cache_hits = 0
+    # Encodec model is heavy; default to sequential to avoid repeated downloads in workers
+    use_parallel = False if num_workers is None else (num_workers > 1 and len(wav_paths) > 4)
+    if not use_parallel:
+        for wav in wav_paths:
+            codes, T, info, hit = _load_or_compute_codes_cached(wav, cache_dir, model_id)
+            if info_ref is None:
+                info_ref = info
+            cache_hits += int(bool(hit))
+            codes_list.append(codes)
+            code_lens.append(int(T))
+    else:
+        # Parallel path: beware it may download model per worker; not recommended unless cache is warm
+        import concurrent.futures
+        def _worker(arg):
+            wp, cd = arg
+            return _load_or_compute_codes_cached(wp, cd, model_id)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as ex:
+            for codes, T, info, hit in ex.map(_worker, [(w, cache_dir) for w in wav_paths]):
+                if info_ref is None:
+                    info_ref = info
+                cache_hits += int(bool(hit))
+                codes_list.append(codes)
+                code_lens.append(int(T))
+
+    if cache_dir:
+        try:
+            print(f"[preprocess-encodec] cache: hits={cache_hits}/{len(wav_paths)} dir={os.path.abspath(cache_dir)}")
+        except Exception:
+            pass
+
+    if info_ref is None:
+        raise RuntimeError("Failed to obtain Encodec model info")
+
+    return items, text_ids, codes_list, np.asarray(code_lens, dtype=np.int32), info_ref
+
 
 # ====== Sequence utilities ======
 def _pad_1d(seqs, pad_val=0):
@@ -824,6 +944,82 @@ class TTSDataset(tf.keras.utils.Sequence):
         # خروجی‌های مدل (inputs, targets)
         inputs = {"enc_ids": enc, "dec_mel": dec_in, "mel_len": mel_len}
         targets = {"mel_pre": mel, "mel_post": mel, "stop": stop}
+        return inputs, targets
+
+# ====== Dataset for Encodec codes ======
+class TTSCodesDataset(tf.keras.utils.Sequence):
+    def __init__(self,
+                 text_ids_list,
+                 codes_list,
+                 *,
+                 batch_size: int,
+                 pad_id: int,
+                 num_codebooks: int,
+                 codebook_size: int,
+                 max_src_len: int,
+                 max_code_len: int,
+                 shuffle: bool = True):
+        assert len(text_ids_list) == len(codes_list)
+        self.text_ids = text_ids_list
+        self.codes = codes_list
+        self.bs = int(batch_size)
+        self.pad_id = int(pad_id)
+        self.K = int(num_codebooks)
+        self.C = int(codebook_size)
+        self.max_src_len = int(max_src_len)
+        self.max_code_len = int(max_code_len)
+        self.shuffle = bool(shuffle)
+        self.indices = np.arange(len(self.text_ids))
+        self.on_epoch_end()
+
+    def __len__(self):
+        return math.floor(len(self.indices) / self.bs)
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    @staticmethod
+    def _shift_right_codes_np(code_batch, pad_val=0):
+        # code_batch: (B, T, K)
+        B, T, K = code_batch.shape
+        out = np.full_like(code_batch, fill_value=pad_val, dtype=np.int32)
+        out[:, 1:, :] = code_batch[:, :-1, :]
+        out[:, 0, :] = pad_val
+        return out
+
+    def __getitem__(self, idx):
+        idxs = self.indices[idx*self.bs:(idx+1)*self.bs]
+
+        B = len(idxs)
+        enc = np.full((B, self.max_src_len), fill_value=self.pad_id, dtype=np.int32)
+        codes = np.full((B, self.max_code_len, self.K), fill_value=0, dtype=np.int32)
+        code_len = np.zeros((B,), dtype=np.int32)
+
+        for i, k in enumerate(idxs):
+            ids = self.text_ids[k]
+            code_np = self.codes[k]  # (T, K)
+
+            # Text: truncate + pad
+            ids = ids[:self.max_src_len]
+            enc[i, :len(ids)] = np.asarray(ids, dtype=np.int32)
+
+            # Codes: truncate + pad
+            T = min(code_np.shape[0], self.max_code_len)
+            codes[i, :T, :] = code_np[:T, :]
+            code_len[i] = T
+
+        # teacher forcing: shift-right codes
+        dec_in = self._shift_right_codes_np(codes, pad_val=0)
+
+        # stop targets: after code_len ⇒ 1
+        stop = np.zeros((B, self.max_code_len, 1), dtype=np.float32)
+        for i in range(B):
+            if code_len[i] < self.max_code_len:
+                stop[i, code_len[i]:, 0] = 1.0
+
+        inputs = {"enc_ids": enc, "dec_codes": dec_in, "codes_len": code_len}
+        targets = {"codes": codes, "stop": stop}
         return inputs, targets
 # =========================================================
 # (اختیاری) ساخت ورودی teacher forcing برای Keras.fit با tf.data

@@ -32,6 +32,9 @@ class ModelConfig:
     droppath_rate: float = 0.05
     use_prenet: bool = True
     prenet_drop: float = 0.5
+    # Control PostNet usage to simplify the model, if desired
+    use_postnet: bool = True
+    # Optional diagonal window for cross-attention
     cross_win: Optional[float] = 0.2
     max_length: int = 4096
     # New architectural options
@@ -43,31 +46,37 @@ class ModelConfig:
 PRESETS: Dict[str, ModelConfig] = {
     "tiny": ModelConfig(
         num_layers=4, d_model=256, num_heads=4, dff=1024,
-        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, use_postnet=True, cross_win=0.2,
     ),
     "normal": ModelConfig(
         num_layers=8, d_model=512, num_heads=8, dff=2048,
-        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, use_postnet=True, cross_win=0.2,
     ),
     "large": ModelConfig(
         num_layers=12, d_model=768, num_heads=12, dff=3072,
-        dropout_rate=0.1, droppath_rate=0.1, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        dropout_rate=0.1, droppath_rate=0.1, use_prenet=True, prenet_drop=0.5, use_postnet=True, cross_win=0.2,
     ),
     # Modern presets with new architectural features
     "modern_small": ModelConfig(
         num_layers=6, d_model=512, num_heads=8, dff=2048,
-        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, use_postnet=True, cross_win=0.2,
         activation='swiglu', pos_encoding_type='rope'
     ),
     "modern_base": ModelConfig(
         num_layers=8, d_model=512, num_heads=8, dff=2048,
-        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        dropout_rate=0.1, droppath_rate=0.05, use_prenet=True, prenet_drop=0.5, use_postnet=True, cross_win=0.2,
         activation='swiglu', pos_encoding_type='rope'
     ),
     "modern_large": ModelConfig(
         num_layers=12, d_model=768, num_heads=12, dff=3072,
-        dropout_rate=0.1, droppath_rate=0.1, use_prenet=True, prenet_drop=0.5, cross_win=0.2,
+        dropout_rate=0.1, droppath_rate=0.1, use_prenet=True, prenet_drop=0.5, use_postnet=True, cross_win=0.2,
         activation='swiglu', pos_encoding_type='rope'
+    ),
+    # Simple preset: fewer layers and no PostNet for a leaner model
+    "simple": ModelConfig(
+        num_layers=6, d_model=384, num_heads=6, dff=1536,
+        dropout_rate=0.1, droppath_rate=0.0, use_prenet=True, prenet_drop=0.5, use_postnet=False, cross_win=0.2,
+        activation='gelu', pos_encoding_type='sinusoidal'
     ),
 }
 
@@ -137,6 +146,8 @@ class AudioPreset:
 AUDIO_PRESETS: Dict[str, AudioPreset] = {
     "base16k": AudioPreset(),
     "ljspeech22k": AudioPreset(sample_rate=22050, target_sample_rate=22050, fmax=8000.0),
+    # 24 kHz preset to align with Encodec 24kHz
+    "encodec24k": AudioPreset(sample_rate=24000, target_sample_rate=24000, n_fft=1024, hop_length=256, win_length=1024, n_mels=80, fmin=0.0, fmax=12000.0),
 }
 
 

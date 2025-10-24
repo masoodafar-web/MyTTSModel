@@ -1,1092 +1,477 @@
-# MyTTSModel.py
-"""
-MyTTSModel - Transformer-based Text-to-Speech Model
-
-This module implements a complete Transformer architecture for text-to-speech synthesis.
-It includes:
-- Positional encoding utilities
-- Encoder and Decoder with multi-head attention
-- PostNet for mel-spectrogram refinement
-- Greedy generation for inference
-
-The model uses teacher forcing during training and autoregressive generation during inference.
-"""
-
+# =========================
+# Diffusion Model Components (DDPM-style)
+# =========================
 import tensorflow as tf
 from tensorflow.keras import layers
-import numpy as np
 
-# =========================
-# Positional Encoding
-# =========================
-def positional_encoding(length, d_model):
+class SinusoidalPositionalEncoding(layers.Layer):
     """
-    Generate sinusoidal positional encoding for Transformer models.
-    
-    Uses alternating sine and cosine functions at different frequencies to encode
-    position information that can be added to token embeddings.
-    
-    Args:
-        length (int): Maximum sequence length to generate encodings for.
-        d_model (int): Dimension of the model (embedding size).
-        
-    Returns:
-        tf.Tensor: Positional encoding tensor of shape (length, d_model).
-        
-    Example:
-        >>> pos_enc = positional_encoding(100, 256)
-        >>> pos_enc.shape
-        TensorShape([100, 256])
+    Sinusoidal positional encoding for diffusion timesteps.
     """
-    positions = np.arange(length)[:, None]
-    dims = np.arange(d_model)[None, :]
-    angle_rates = 1.0 / np.power(10000.0, (2 * (dims // 2)) / np.float32(d_model))
-    angle_rads = positions * angle_rates
-    pos = np.zeros((length, d_model), dtype=np.float32)
-    pos[:, 0::2] = np.sin(angle_rads[:, 0::2])
-    pos[:, 1::2] = np.cos(angle_rads[:, 1::2])
-    return tf.convert_to_tensor(pos, dtype=tf.float32)
 
-
-class RotaryPositionEmbedding(layers.Layer):
-    """
-    Rotary Position Embedding (RoPE) for improved position encoding.
-    
-    RoPE applies rotation to query and key vectors based on their absolute positions,
-    providing better relative position awareness compared to additive position encodings.
-    This is a modern alternative used in models like LLaMA and PaLM.
-    
-    Args:
-        d_model (int): Model dimension (must be even).
-        max_length (int): Maximum sequence length. Default: 4096.
-        base (float): Base for frequency calculation. Default: 10000.0.
-        name (str, optional): Layer name.
-    
-    Reference:
-        RoFormer: Enhanced Transformer with Rotary Position Embedding
-        https://arxiv.org/abs/2104.09864
-    """
-    
-    def __init__(self, d_model, max_length=4096, base=10000.0, name=None):
+    def __init__(self, dim, max_period=10000, name=None):
         super().__init__(name=name)
-        if d_model % 2 != 0:
-            raise ValueError(f"d_model must be even for RoPE, got {d_model}")
-        self.d_model = d_model
-        self.max_length = max_length
-        self.base = base
-        
-        # Precompute rotation matrices
-        inv_freq = 1.0 / (base ** (np.arange(0, d_model, 2).astype(np.float32) / d_model))
-        position = np.arange(max_length, dtype=np.float32)
-        freqs = np.outer(position, inv_freq)  # (max_length, d_model//2)
-        
-        # Create sin and cos for rotation
-        self.cos_cached = tf.convert_to_tensor(np.cos(freqs), dtype=tf.float32)  # (L, D/2)
-        self.sin_cached = tf.convert_to_tensor(np.sin(freqs), dtype=tf.float32)  # (L, D/2)
-    
-    def call(self, x):
-        """
-        Apply rotary position embedding to input tensor.
-        
-        Args:
-            x (tf.Tensor): Input of shape (batch_size, seq_len, d_model).
-            
-        Returns:
-            tf.Tensor: Position-encoded tensor of same shape.
-        """
-        seq_len = tf.shape(x)[1]
-        
-        # Get cached sin/cos for current sequence length
-        cos = self.cos_cached[:seq_len, :]  # (T, D/2)
-        sin = self.sin_cached[:seq_len, :]  # (T, D/2)
-        
-        # Split features into pairs and apply rotation
-        x1, x2 = tf.split(x, 2, axis=-1)  # Each (B, T, D/2)
-        
-        # Broadcast and apply rotation: [cos*x1 - sin*x2, sin*x1 + cos*x2]
-        cos = tf.cast(cos, x.dtype)[None, :, :]  # (1, T, D/2)
-        sin = tf.cast(sin, x.dtype)[None, :, :]  # (1, T, D/2)
-        
-        rotated_x1 = x1 * cos - x2 * sin
-        rotated_x2 = x1 * sin + x2 * cos
-        
-        return tf.concat([rotated_x1, rotated_x2], axis=-1)  # (B, T, D)
+        self.dim = dim
+        self.max_period = max_period
 
-# =========================
-# Embeddings
-# =========================
-class PositionalEmbedding(layers.Layer):
+    def call(self, timesteps):
+        # timesteps: (B,) or scalar
+        half_dim = self.dim // 2
+        exponents = tf.range(half_dim, dtype=tf.float32) / half_dim
+        freqs = tf.exp(-tf.math.log(self.max_period) * exponents)
+        args = timesteps[:, None] * freqs[None, :]
+        return tf.concat([tf.sin(args), tf.cos(args)], axis=-1)
+
+
+class DiffusionDenoiser(layers.Layer):
     """
-    Embedding layer with added positional encoding for text tokens.
-    
-    Combines learned token embeddings with fixed sinusoidal positional encodings,
-    scaled by sqrt(d_model) as in the original Transformer paper.
-    
-    Args:
-        vocab_size (int): Size of the vocabulary.
-        d_model (int): Dimension of the embedding space.
-        max_length (int): Maximum sequence length supported. Default: 2048.
-        name (str, optional): Layer name.
-        
-    Attributes:
-        embedding (layers.Embedding): Token embedding layer.
-        pos_encoding (tf.Tensor): Pre-computed positional encodings.
+    Diffusion denoiser network for Tortoise-style mel generation.
+    Uses a Transformer decoder conditioned on text and voice latents.
     """
-    
-    def __init__(self, vocab_size, d_model, max_length=2048, name=None):
+
+    def __init__(self, num_layers, d_model, num_heads, dff, n_mels,
+                 dropout_rate=0.1, max_length=4096, name="diffusion_denoiser"):
         super().__init__(name=name)
-        self.d_model = d_model
-        self.embedding = layers.Embedding(vocab_size, d_model, mask_zero=False, name="tok_emb")
-        self.pos_encoding = positional_encoding(max_length, d_model)
+        self.n_mels = n_mels
+        self.time_embed = SinusoidalPositionalEncoding(d_model)
 
-    def call(self, x):
-        """
-        Apply embedding and positional encoding to input token IDs.
-        
-        Args:
-            x (tf.Tensor): Input token IDs of shape (batch_size, seq_len).
-            
-        Returns:
-            tf.Tensor: Embedded tokens with positional encoding, shape (batch_size, seq_len, d_model).
-        """
-        length = tf.shape(x)[1]
-        x = self.embedding(x)                                  # (B,L,D)
-        x = tf.cast(x, tf.float32)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x = x + self.pos_encoding[tf.newaxis, :length, :]
-        return x
+        # Mel projection (noisy mel input)
+        self.mel_proj = MelPositionalProjection(n_mels, d_model, max_length=max_length, name="mel_proj")
 
-class MelPositionalProjection(layers.Layer):
-    """
-    Projects mel-spectrogram features to model dimension with positional encoding.
-    
-    Uses an optional prenet (bottleneck layers with dropout for better convergence)
-    to project mel features to d_model dimension, then adds positional encoding.
-    
-    Args:
-        n_mels (int): Number of mel-spectrogram bands.
-        d_model (int): Target model dimension.
-        max_length (int): Maximum sequence length. Default: 4096.
-        name (str, optional): Layer name.
-        use_prenet (bool): Whether to use prenet layers. Default: True.
-        prenet_drop (float): Dropout rate for prenet layers. Default: 0.5.
-        
-    Attributes:
-        prenet (tf.keras.Sequential or layers.Dense): Feature projection layer(s).
-        pos_encoding (tf.Tensor): Pre-computed positional encodings.
-    """
-    
-    def __init__(self, n_mels, d_model, max_length=4096, name=None, use_prenet=True, prenet_drop=0.5):
-        super().__init__(name=name)
-        self.d_model = d_model
-        self.use_prenet = use_prenet
-        if use_prenet:
-            self.prenet = tf.keras.Sequential([
-                layers.Dense(256, activation="relu"),
-                layers.Dropout(prenet_drop),
-                layers.Dense(256, activation="relu"),
-                layers.Dropout(prenet_drop),
-                layers.Dense(d_model),
-            ], name="prenet")
-        else:
-            self.prenet = layers.Dense(d_model, name="prenet_linear")
-        self.pos_encoding = positional_encoding(max_length, d_model)
+        # Time embedding projection
+        self.time_proj = layers.Dense(d_model, name="time_proj")
 
-    def call(self, mel):
-        """
-        Project mel-spectrogram to model dimension and add positional encoding.
-        
-        Args:
-            mel (tf.Tensor): Input mel-spectrogram of shape (batch_size, time, n_mels).
-            
-        Returns:
-            tf.Tensor: Projected and positionally encoded features of shape (batch_size, time, d_model).
-        """
-        # Feed float32 to prenet; it will cast internally if using mixed precision
-        x = tf.cast(mel, tf.float32)
-        x = self.prenet(x)                                     # (B,T,D), may be float16 under mixed precision
-        scale = tf.math.sqrt(tf.cast(tf.shape(x)[-1], x.dtype))
-        x = x * scale
-        length = tf.shape(x)[1]
-        pos = tf.cast(self.pos_encoding[tf.newaxis, :length, :], x.dtype)
-        x = x + pos
-        return x
+        # Voice latent conditioning (from autoencoder)
+        self.voice_proj = layers.Dense(d_model, name="voice_proj")
 
-# =========================
-# Mask helpers
-# =========================
-def make_padding_bool(ids, pad_id):
-    """
-    Create boolean mask indicating valid (non-padding) positions.
-    
-    Args:
-        ids (tf.Tensor): Input token IDs of shape (batch_size, seq_len).
-        pad_id (int): Padding token ID.
-        
-    Returns:
-        tf.Tensor: Boolean mask where True indicates valid positions, shape (batch_size, seq_len).
-    """
-    return tf.not_equal(ids, tf.cast(pad_id, ids.dtype))
-
-def key_mask_from_valid(valid_bool):
-    """
-    Convert boolean valid mask to key mask format for MultiHeadAttention.
-    
-    Args:
-        valid_bool (tf.Tensor): Boolean mask of shape (batch_size, seq_len).
-        
-    Returns:
-        tf.Tensor: Key mask of shape (batch_size, 1, seq_len) where True indicates allowed positions.
-    """
-    # Keras MHA expects True where allowed
-    return valid_bool[:, None, :]  # (B,1,S)
-
-def make_causal_mask(T):
-    """
-    Create causal (lower-triangular) mask for autoregressive attention.
-    
-    Args:
-        T (int): Sequence length.
-        
-    Returns:
-        tf.Tensor: Boolean causal mask of shape (T, T) where True indicates allowed positions.
-    """
-    return tf.linalg.band_part(tf.ones((T, T), dtype=tf.bool), -1, 0)
-
-def combine_causal_and_keypadding(dec_valid_bool):
-    """
-    Combine causal mask with key padding mask for decoder self-attention.
-    
-    Args:
-        dec_valid_bool (tf.Tensor): Boolean valid mask of shape (batch_size, seq_len).
-        
-    Returns:
-        tf.Tensor: Combined mask of shape (batch_size, seq_len, seq_len) where True indicates
-                   allowed positions (both causal and not padding).
-    """
-    T = tf.shape(dec_valid_bool)[1]
-    causal = make_causal_mask(T)                  # (T,T) True at <=
-    key_mask = key_mask_from_valid(dec_valid_bool)  # (B,1,T)
-    # Broadcast to (B,T,T), True where allowed
-    return tf.logical_and(key_mask, causal[None, :, :])        # (B,T,T)
-
-# =========================
-# DropPath
-# =========================
-class DropPath(layers.Layer):
-    """
-    Stochastic depth layer that randomly drops entire residual paths during training.
-    
-    Implements DropPath/Stochastic Depth for better gradient flow and regularization
-    in deep networks. During training, randomly drops entire paths with probability drop_prob.
-    
-    Args:
-        drop_prob (float): Probability of dropping a path. Default: 0.0.
-        name (str, optional): Layer name.
-    """
-    
-    def __init__(self, drop_prob=0.0, name=None):
-        super().__init__(name=name)
-        self.drop_prob = float(drop_prob)
-        self.supports_masking = True
-
-    def call(self, x, training=False):
-        """
-        Apply DropPath to input tensor.
-        Ensures dtype consistency under mixed precision by casting to x.dtype.
-        
-        Args:
-            x (tf.Tensor): Input tensor.
-            training (bool): Whether in training mode.
-            
-        Returns:
-            tf.Tensor: Output tensor, possibly with paths dropped.
-        """
-        if (not training) or self.drop_prob == 0.0:
-            return x
-        keep_prob = tf.cast(1.0 - self.drop_prob, x.dtype)
-        shape = (tf.shape(x)[0],) + (1,) * (len(x.shape) - 1)
-        random_tensor = keep_prob + tf.random.uniform(shape, 0, 1, dtype=x.dtype)
-        binary_tensor = tf.floor(random_tensor)
-        return (x / keep_prob) * binary_tensor
-
-# =========================
-# Attention Blocks (Pre-Norm)
-# =========================
-class BaseAttentionPreNorm(layers.Layer):
-    """
-    Base attention layer with pre-normalization and residual connection.
-    
-    Implements a self-attention or cross-attention layer with:
-    - Pre-LayerNorm for better training stability
-    - Optional DropPath for regularization
-    - Residual connection
-    - Support for attention weight extraction
-    
-    Args:
-        num_heads (int): Number of attention heads.
-        d_model (int): Model dimension.
-        dropout (float): Dropout rate.
-        droppath (float): DropPath rate. Default: 0.0.
-        name (str, optional): Layer name.
-    """
-    
-    def __init__(self, *, num_heads, d_model, dropout, droppath=0.0, name=None):
-        super().__init__(name=name)
-        self.norm = layers.LayerNormalization(epsilon=1e-5, name="ln")
-        self.mha = layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=d_model // num_heads,
-            dropout=dropout,
-            name="mha"
+        # Cross-attention layers for text and voice conditioning
+        self.cross_attn_text = BaseAttentionPreNorm(
+            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, name="cross_attn_text"
         )
-        self.res_dropout = layers.Dropout(dropout, name="res_drop")
-        self.drop_path = DropPath(droppath, name="droppath") if droppath > 0 else None
-        self.add = layers.Add(name="add")
-
-    def call(self, x, *, context=None, attn_mask=None, q_valid=None, training=False, need_attn=False):
-        """
-        Apply attention with pre-normalization.
-        
-        Args:
-            x (tf.Tensor): Query input of shape (batch_size, seq_len, d_model).
-            context (tf.Tensor, optional): Key/value input for cross-attention. If None, performs self-attention.
-            attn_mask (tf.Tensor, optional): Attention mask.
-            q_valid (tf.Tensor, optional): Query validity mask.
-            training (bool): Whether in training mode.
-            need_attn (bool): Whether to return attention scores.
-            
-        Returns:
-            tf.Tensor or tuple: Output tensor, optionally with attention scores if need_attn=True.
-        """
-        xn = self.norm(x)
-        # Normalize attention_mask semantics across TF versions:
-        # Convert boolean "allowed" masks to additive bias: 0 for allowed, -1e9 for blocked.
-        attn_bias = None
-        if attn_mask is not None:
-            if attn_mask.dtype == tf.bool:
-                # Here, True means "allowed" in our code. Convert to bias where blocked -> -1e9
-                zeros = tf.zeros_like(tf.cast(attn_mask, tf.float32))
-                neginf = tf.fill(tf.shape(attn_mask), tf.constant(-1e9, tf.float32))
-                attn_bias = tf.where(attn_mask, zeros, neginf)
-            else:
-                attn_bias = tf.cast(attn_mask, tf.float32)
-
-        if context is None:
-            if need_attn:
-                h, scores = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_bias,
-                                     training=training, return_attention_scores=True)
-            else:
-                h = self.mha(query=xn, key=xn, value=xn, attention_mask=attn_bias, training=training)
-                scores = None
-        else:
-            if need_attn:
-                h, scores = self.mha(query=xn, key=context, value=context, attention_mask=attn_bias,
-                                     training=training, return_attention_scores=True)
-            else:
-                h = self.mha(query=xn, key=context, value=context, attention_mask=attn_bias, training=training)
-                scores = None
-        if q_valid is not None:
-            h *= tf.cast(q_valid[..., None], h.dtype)
-        h = self.res_dropout(h, training=training)
-        if self.drop_path is not None:
-            h = self.drop_path(h, training=training)
-        out = self.add([x, h])
-        if need_attn:
-            return out, scores
-        return out
-
-class FeedForwardPreNorm(layers.Layer):
-    """
-    Feed-forward network with pre-normalization and residual connection.
-    
-    Implements a two-layer FFN with configurable activation (GELU or SwiGLU),
-    pre-LayerNorm, dropout, and optional DropPath for regularization.
-    
-    SwiGLU uses gating mechanism for improved representation learning:
-        SwiGLU(x) = (W1*x * swish(W_gate*x)) * W2
-    
-    Args:
-        d_model (int): Model dimension.
-        dff (int): Feed-forward intermediate dimension.
-        dropout (float): Dropout rate. Default: 0.1.
-        droppath (float): DropPath rate. Default: 0.0.
-        activation (str): Activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
-        name (str, optional): Layer name.
-        
-    Reference:
-        GLU Variants Improve Transformer (SwiGLU)
-        https://arxiv.org/abs/2002.05202
-    """
-    
-    def __init__(self, d_model, dff, dropout=0.1, droppath=0.0, activation='gelu', name=None):
-        super().__init__(name=name)
-        self.activation_type = activation
-        self.norm = layers.LayerNormalization(epsilon=1e-5, name="ln")
-        
-        if activation == 'swiglu':
-            # SwiGLU uses gated mechanism, requires two projections to dff
-            self.w1 = layers.Dense(dff, name="w1")
-            self.w_gate = layers.Dense(dff, name="w_gate")
-            self.dropout1 = layers.Dropout(dropout, name="drop1")
-            self.w2 = layers.Dense(d_model, name="w2")
-        else:
-            # Standard GELU FFN
-            self.seq = tf.keras.Sequential([
-                layers.Dense(dff, activation=tf.keras.activations.gelu, name="fc1"),
-                layers.Dropout(dropout, name="drop"),
-                layers.Dense(d_model, name="fc2"),
-            ], name="ff")
-        
-        self.res_dropout = layers.Dropout(dropout, name="res_drop")
-        self.drop_path = DropPath(droppath, name="droppath") if droppath > 0 else None
-        self.add = layers.Add(name="add")
-
-    def call(self, x, training=False):
-        """
-        Apply feed-forward network with pre-normalization.
-        
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-            training (bool): Whether in training mode.
-            
-        Returns:
-            tf.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
-        """
-        h = self.norm(x)
-        
-        if self.activation_type == 'swiglu':
-            # Apply SwiGLU: (W1*x * swish(W_gate*x)) * W2
-            gate = tf.nn.swish(self.w_gate(h))
-            h = self.w1(h) * gate
-            h = self.dropout1(h, training=training)
-            h = self.w2(h)
-        else:
-            # Standard GELU FFN
-            h = self.seq(h, training=training)
-        
-        h = self.res_dropout(h, training=training)
-        if self.drop_path is not None:
-            h = self.drop_path(h, training=training)
-        return self.add([x, h])
-
-# =========================
-# Encoder / Decoder Layers
-# =========================
-class EncoderLayer(layers.Layer):
-    """
-    Single Transformer encoder layer with self-attention and feed-forward network.
-    
-    Args:
-        d_model (int): Model dimension.
-        num_heads (int): Number of attention heads.
-        dff (int): Feed-forward intermediate dimension.
-        dropout_rate (float): Dropout rate. Default: 0.1.
-        droppath (float): DropPath rate. Default: 0.0.
-        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
-        name (str, optional): Layer name.
-    """
-    
-    def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1, droppath=0.0, activation='gelu', name=None):
-        super().__init__(name=name)
-        self.self_attention = BaseAttentionPreNorm(
-            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, droppath=droppath, name="self_attn"
+        self.cross_attn_voice = BaseAttentionPreNorm(
+            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, name="cross_attn_voice"
         )
-        self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, 
-                                     activation=activation, name="ffn")
 
-    def call(self, x, key_mask=None, q_valid=None, training=False):
-        """
-        Process input through encoder layer.
-        
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-            key_mask (tf.Tensor, optional): Key padding mask.
-            q_valid (tf.Tensor, optional): Query validity mask.
-            training (bool): Whether in training mode.
-            
-        Returns:
-            tf.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
-        """
-        x = self.self_attention(x, attn_mask=key_mask, q_valid=q_valid, training=training)
-        x = self.ffn(x, training=training)
-        return x
-
-class DecoderLayer(layers.Layer):
-    """
-    Single Transformer decoder layer with causal self-attention, cross-attention, and FFN.
-    
-    Args:
-        d_model (int): Model dimension.
-        num_heads (int): Number of attention heads.
-        dff (int): Feed-forward intermediate dimension.
-        dropout_rate (float): Dropout rate. Default: 0.1.
-        droppath (float): DropPath rate. Default: 0.0.
-        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
-        name (str, optional): Layer name.
-    """
-    
-    def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1, droppath=0.0, activation='gelu', name=None):
-        super().__init__(name=name)
-        self.causal_self_attention = BaseAttentionPreNorm(
-            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, droppath=droppath, name="causal_self_attn"
-        )
-        self.cross_attention = BaseAttentionPreNorm(
-            num_heads=num_heads, d_model=d_model, dropout=dropout_rate, droppath=droppath, name="cross_attn"
-        )
-        self.ffn = FeedForwardPreNorm(d_model, dff, dropout=dropout_rate, droppath=droppath, 
-                                     activation=activation, name="ffn")
-
-    def call(self, x, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False, need_attn=False):
-        """
-        Process input through decoder layer.
-        
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-            context (tf.Tensor): Encoder output for cross-attention of shape (batch_size, src_len, d_model).
-            dec_causal_key_mask (tf.Tensor, optional): Causal mask for decoder self-attention.
-            enc_key_mask (tf.Tensor, optional): Encoder key padding mask.
-            q_valid (tf.Tensor, optional): Query validity mask.
-            training (bool): Whether in training mode.
-            need_attn (bool): Whether to return cross-attention scores.
-            
-        Returns:
-            tf.Tensor or tuple: Output tensor, optionally with attention scores if need_attn=True.
-        """
-        x = self.causal_self_attention(x, attn_mask=dec_causal_key_mask, q_valid=q_valid, training=training)
-        if need_attn:
-            x, scores = self.cross_attention(x, context=context, attn_mask=enc_key_mask, q_valid=q_valid,
-                                             training=training, need_attn=True)
-        else:
-            x = self.cross_attention(x, context=context, attn_mask=enc_key_mask, q_valid=q_valid, training=training)
-            scores = None
-        x = self.ffn(x, training=training)
-        if need_attn:
-            return x, scores
-        return x
-
-# =========================
-# Encoder / Decoder Stacks
-# =========================
-class Encoder(tf.keras.Model):
-    """
-    Transformer encoder stack for text encoding.
-    
-    Stacks multiple encoder layers with optional stochastic depth (DropPath).
-    Includes token embedding with positional encoding (sinusoidal or RoPE) and input dropout.
-    
-    Args:
-        num_layers (int): Number of encoder layers.
-        d_model (int): Model dimension.
-        num_heads (int): Number of attention heads.
-        dff (int): Feed-forward intermediate dimension.
-        vocab_size (int): Vocabulary size.
-        dropout_rate (float): Dropout rate. Default: 0.1.
-        droppath_rate (float): Maximum DropPath rate (linearly increases across layers). Default: 0.0.
-        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
-        pos_encoding_type (str): Position encoding: 'sinusoidal' or 'rope'. Default: 'sinusoidal'.
-        name (str): Model name. Default: "encoder".
-    """
-    
-    def __init__(self, *, num_layers, d_model, num_heads, dff, vocab_size,
-                 dropout_rate=0.1, droppath_rate=0.0, activation='gelu', 
-                 pos_encoding_type='sinusoidal', name="encoder"):
-        super().__init__(name=name)
-        self.pos_encoding_type = pos_encoding_type
-        self.pos_embedding = PositionalEmbedding(vocab_size=vocab_size, d_model=d_model, name="tokpos")
-        
-        if pos_encoding_type == 'rope':
-            self.rope = RotaryPositionEmbedding(d_model=d_model, name="rope")
-        
-        self.dropout = layers.Dropout(dropout_rate, name="dropout")
+        # Decoder layers
         self.layers_ = []
         for i in range(num_layers):
-            dp = 0.0 if droppath_rate == 0.0 else droppath_rate * (i / max(1, num_layers - 1))
-            self.layers_.append(
-                EncoderLayer(d_model=d_model, num_heads=num_heads, dff=dff,
-                             dropout_rate=dropout_rate, droppath=dp, activation=activation, name=f"block_{i}")
-            )
-
-    def call(self, ids, key_mask=None, q_valid=None, training=False):
-        """
-        Encode input token IDs.
-        
-        Args:
-            ids (tf.Tensor): Input token IDs of shape (batch_size, seq_len).
-            key_mask (tf.Tensor, optional): Key padding mask.
-            q_valid (tf.Tensor, optional): Query validity mask.
-            training (bool): Whether in training mode.
-            
-        Returns:
-            tf.Tensor: Encoded representations of shape (batch_size, seq_len, d_model).
-        """
-        x = self.pos_embedding(ids)
-        
-        if self.pos_encoding_type == 'rope':
-            x = self.rope(x)
-        
-        x = self.dropout(x, training=training)
-        for lyr in self.layers_:
-            x = lyr(x, key_mask=key_mask, q_valid=q_valid, training=training)
-        return x  # (B,S,D)
-
-class DecoderTTS(tf.keras.Model):
-    """
-    Transformer decoder stack for mel-spectrogram generation.
-    
-    Stacks multiple decoder layers with causal self-attention and cross-attention
-    to encoder outputs. Includes mel prenet for feature projection.
-    
-    Args:
-        num_layers (int): Number of decoder layers.
-        d_model (int): Model dimension.
-        num_heads (int): Number of attention heads.
-        dff (int): Feed-forward intermediate dimension.
-        n_mels (int): Number of mel-spectrogram bands.
-        dropout_rate (float): Dropout rate. Default: 0.1.
-        droppath_rate (float): Maximum DropPath rate. Default: 0.0.
-        name (str): Model name. Default: "decoder_tts".
-        use_prenet (bool): Whether to use prenet layers. Default: True.
-        prenet_drop (float): Prenet dropout rate. Default: 0.5.
-        activation (str): FFN activation type: 'gelu' or 'swiglu'. Default: 'gelu'.
-    """
-    
-    def __init__(self, *, num_layers, d_model, num_heads, dff, n_mels,
-                 dropout_rate=0.1, droppath_rate=0.0, name="decoder_tts",
-                 use_prenet=True, prenet_drop=0.5, activation='gelu'):
-        super().__init__(name=name)
-        self.mel_proj = MelPositionalProjection(n_mels=n_mels, d_model=d_model,
-                                                name="melpos", use_prenet=use_prenet, prenet_drop=prenet_drop)
-        self.dropout = layers.Dropout(dropout_rate, name="dropout")
-        self.layers_ = []
-        for i in range(num_layers):
-            dp = 0.0 if droppath_rate == 0.0 else droppath_rate * (i / max(1, num_layers - 1))
+            dp = 0.0 if dropout_rate == 0.0 else dropout_rate * (i / max(1, num_layers - 1))
             self.layers_.append(
                 DecoderLayer(d_model=d_model, num_heads=num_heads, dff=dff,
-                             dropout_rate=dropout_rate, droppath=dp, activation=activation, name=f"block_{i}")
+                            dropout_rate=dropout_rate, droppath=dp, name=f"dec_layer_{i}")
             )
 
-    def call(self, mel_in, context, dec_causal_key_mask=None, enc_key_mask=None, q_valid=None, training=False, return_attn=False):
-        """
-        Decode mel-spectrogram autoregressively.
-        
-        Args:
-            mel_in (tf.Tensor): Input mel-spectrogram of shape (batch_size, time, n_mels).
-            context (tf.Tensor): Encoder output of shape (batch_size, src_len, d_model).
-            dec_causal_key_mask (tf.Tensor, optional): Causal mask for self-attention.
-            enc_key_mask (tf.Tensor, optional): Encoder key padding mask.
-            q_valid (tf.Tensor, optional): Query validity mask.
-            training (bool): Whether in training mode.
-            return_attn (bool): Whether to return attention weights from last layer.
-            
-        Returns:
-            tf.Tensor or tuple: Decoded features of shape (batch_size, time, d_model),
-                               optionally with attention weights if return_attn=True.
-        """
-        x = self.mel_proj(mel_in)
-        x = self.dropout(x, training=training)
-        last_scores = None
-        for i, lyr in enumerate(self.layers_):
-            need_attn = bool(return_attn) and (i == len(self.layers_) - 1)
-            if need_attn:
-                x, last_scores = lyr(x, context, dec_causal_key_mask=dec_causal_key_mask,
-                                     enc_key_mask=enc_key_mask, q_valid=q_valid, training=training, need_attn=True)
-            else:
-                x = lyr(x, context, dec_causal_key_mask=dec_causal_key_mask,
-                        enc_key_mask=enc_key_mask, q_valid=q_valid, training=training)
-        if return_attn:
-            # Keras MHA scores shape: (B, num_heads, T_dec, S_enc). Reduce heads → (B, T_dec, S_enc)
-            if last_scores is not None:
-                last_scores = tf.reduce_mean(tf.cast(last_scores, tf.float32), axis=1)
-        return (x, last_scores) if return_attn else x  # (B,T,D) and optional (B,T,S)
+        self.dropout = layers.Dropout(dropout_rate)
+        self.final_norm = layers.LayerNormalization(epsilon=1e-5, name="final_norm")
+        self.output_proj = layers.Dense(n_mels, name="output_proj")
 
-# =========================
-# PostNet
-# =========================
-class PostNet(layers.Layer):
-    """
-    Convolutional PostNet for refining mel-spectrogram predictions.
-    
-    Applies 4 convolutional layers with batch normalization, tanh activation, and dropout,
-    followed by a final convolutional layer. The output is added as a residual to the
-    initial mel prediction for refinement.
-    
-    Architecture: 4×(Conv1D->BN->tanh->Dropout) + 1×(Conv1D->BN) → n_mels
-    
-    Args:
-        n_mels (int): Number of mel-spectrogram bands.
-        channels (int): Number of channels in hidden layers. Default: 512.
-        num_layers (int): Total number of convolutional layers. Default: 5.
-        kernel_size (int): Convolution kernel size. Default: 5.
-        dropout (float): Dropout rate. Default: 0.5.
-        name (str): Layer name. Default: "postnet".
-    """
-    def __init__(self, n_mels, channels=512, num_layers=5, kernel_size=5, dropout=0.5, name="postnet"):
-        super().__init__(name=name)
-        assert num_layers >= 2, "PostNet needs at least 2 layers"
-        self.layers_ = []
-        for i in range(num_layers - 1):
-            self.layers_.append(layers.Conv1D(filters=channels, kernel_size=kernel_size, padding="same", name=f"conv_{i}"))
-            self.layers_.append(layers.BatchNormalization(name=f"bn_{i}"))
-            self.layers_.append(layers.Activation("tanh", name=f"tanh_{i}"))
-            self.layers_.append(layers.Dropout(dropout, name=f"drop_{i}"))
-        self.layers_.append(layers.Conv1D(filters=n_mels, kernel_size=kernel_size, padding="same", name=f"conv_out"))
-        self.layers_.append(layers.BatchNormalization(name=f"bn_out"))
+    def call(self, noisy_mel, timesteps, text_context, voice_latents, training=False):
+        """
+        Denoise mel-spectrogram conditioned on text and voice.
 
-    def call(self, mel_pred, training=False):
-        """
-        Apply PostNet to refine mel-spectrogram.
-        
         Args:
-            mel_pred (tf.Tensor): Input mel-spectrogram of shape (batch_size, time, n_mels).
-            training (bool): Whether in training mode.
-            
+            noisy_mel: (B, T, n_mels) - Noisy mel input
+            timesteps: (B,) - Diffusion timesteps
+            text_context: (B, S, D) - Text encoder outputs
+            voice_latents: (B, L, D) - Voice conditioning latents
+            training: bool
+
         Returns:
-            tf.Tensor: Residual refinement of shape (batch_size, time, n_mels).
+            (B, T, n_mels) - Denoised mel prediction
         """
-        x = mel_pred
+        # Time embedding
+        t_emb = self.time_embed(timesteps)  # (B, D)
+        t_emb = self.time_proj(t_emb)  # (B, D)
+
+        # Mel projection
+        x = self.mel_proj(noisy_mel)  # (B, T, D)
+
+        # Add time embedding to mel
+        x = x + t_emb[:, None, :]  # Broadcast to (B, T, D)
+
+        # Voice conditioning projection
+        voice_cond = self.voice_proj(voice_latents)  # (B, L, D)
+
+        # Cross-attention with text
+        x = self.cross_attn_text(x, context=text_context, training=training)
+
+        # Cross-attention with voice
+        x = self.cross_attn_voice(x, context=voice_cond, training=training)
+
+        # Decoder layers (self-attention)
+        T = tf.shape(x)[1]
+        causal_mask = combine_causal_and_keypadding(tf.ones((tf.shape(x)[0], T), dtype=tf.bool))
         for layer in self.layers_:
-            if isinstance(layer, layers.Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
-        return x  # (B,T,n_mels)
+            x = layer(x, context=x, dec_causal_key_mask=causal_mask, training=training)
 
-# =========================
-# TransformerTTS
-# =========================
-class TransformerTTS(tf.keras.Model):
+        x = self.final_norm(x)
+        x = self.dropout(x, training=training)
+        return self.output_proj(x)  # (B, T, n_mels)
+
+
+class VoiceAutoencoder(tf.keras.Model):
     """
-    Complete Transformer-based Text-to-Speech model.
-    
-    Combines encoder, decoder, mel prediction heads, stop token prediction, and PostNet
-    for end-to-end text-to-speech synthesis. Supports both teacher-forcing training
-    and autoregressive inference.
-    
-    Architecture:
-        Text → Encoder → Decoder ← Mel (shifted right)
-                    ↓
-        mel_head → mel_pre → PostNet → mel_post
-                    ↓
-        stop_head → stop_logits
-    
-    Args:
-        num_layers (int): Number of encoder/decoder layers.
-        d_model (int): Model dimension.
-        num_heads (int): Number of attention heads.
-        dff (int): Feed-forward intermediate dimension.
-        input_vocab_size (int): Input vocabulary size.
-        n_mels (int): Number of mel-spectrogram bands.
-        dropout_rate (float): Dropout rate. Default: 0.1.
-        pad_id (int): Padding token ID. Default: 1.
-        droppath_rate (float): Maximum DropPath rate. Default: 0.0.
-        max_length (int): Maximum sequence length. Default: 4096.
-        use_prenet (bool): Whether to use prenet in decoder. Default: True.
-        prenet_drop (float): Prenet dropout rate. Default: 0.5.
-        name (str): Model name. Default: "TransformerTTS".
-    
-    Attributes:
-        encoder (Encoder): Text encoder.
-        decoder (DecoderTTS): Mel decoder.
-        mel_head (layers.Dense): Mel prediction head.
-        stop_head (layers.Dense): Stop token prediction head.
-        postnet (PostNet): Mel refinement network.
-        go_frame (tf.Variable): Learnable go-frame for inference.
+    Autoencoder for voice conditioning latents (similar to Tortoise's CLVP).
     """
-    def __init__(self, *, num_layers, d_model, num_heads, dff,
-                 input_vocab_size, n_mels,
-                 dropout_rate=0.1, pad_id=1, droppath_rate=0.0, max_length=4096,
-                 use_prenet=True, prenet_drop=0.5, cross_win=None, 
-                 activation='gelu', pos_encoding_type='sinusoidal', name="TransformerTTS"):
+
+    def __init__(self, latent_dim=512, n_mels=80, name="voice_autoencoder"):
         super().__init__(name=name)
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-        self.pad_id = int(pad_id)
-        self.max_length = max_length
-        self.n_mels = int(n_mels)
-        # عرض پنجرهٔ قطری برای cross-attention (0..1). None یعنی بدون محدودیت اضافی
-        self.cross_win = None if (cross_win is None) else float(cross_win)
+        self.latent_dim = latent_dim
 
-        self.encoder = Encoder(num_layers=num_layers, d_model=d_model,
-                               num_heads=num_heads, dff=dff,
-                               vocab_size=input_vocab_size,
-                               dropout_rate=dropout_rate,
-                               droppath_rate=droppath_rate, 
-                               activation=activation,
-                               pos_encoding_type=pos_encoding_type,
-                               name="encoder")
-        self.decoder = DecoderTTS(num_layers=num_layers, d_model=d_model,
-                                  num_heads=num_heads, dff=dff,
-                                  n_mels=n_mels,
-                                  dropout_rate=dropout_rate,
-                                  droppath_rate=droppath_rate,
-                                  use_prenet=use_prenet, prenet_drop=prenet_drop, 
-                                  activation=activation,
-                                  name="decoder")
+        # Encoder
+        self.encoder = tf.keras.Sequential([
+            layers.Conv1D(256, 3, strides=2, padding="same", activation="relu"),
+            layers.Conv1D(256, 3, strides=2, padding="same", activation="relu"),
+            layers.Conv1D(latent_dim, 3, strides=2, padding="same"),
+            layers.GlobalAveragePooling1D(),
+        ], name="encoder")
 
-        self.mel_head = layers.Dense(n_mels, name="mel_head")
-        self.stop_head = layers.Dense(1, name="stop_head")
-        self.postnet = PostNet(n_mels=n_mels, channels=512, num_layers=5, kernel_size=5, dropout=0.5, name="postnet")
+        # Decoder
+        self.decoder = tf.keras.Sequential([
+            layers.Dense(256, activation="relu"),
+            layers.RepeatVector(10),  # Assuming ~10 time steps after pooling
+            layers.Conv1DTranspose(256, 3, strides=2, padding="same", activation="relu"),
+            layers.Conv1DTranspose(256, 3, strides=2, padding="same", activation="relu"),
+            layers.Conv1DTranspose(n_mels, 3, strides=2, padding="same"),
+        ], name="decoder")
 
-        # go-frame (قابل یادگیری) برای اینفرنس پایدارتر
-        self.go_frame = self.add_weight(name="go_frame", shape=(1, 1, self.n_mels),
-                                        initializer="zeros", trainable=True)
+    def call(self, mel, training=False):
+        latent = self.encoder(mel, training=training)
+        reconstructed = self.decoder(latent, training=training)
+        return reconstructed, latent
+
+
+class TortoiseDiffusionTTS(tf.keras.Model):
+    """
+    Tortoise-style TTS with diffusion model for mel generation.
+    """
+
+    def __init__(self, num_layers, d_model, num_heads, dff,
+                 input_vocab_size, n_mels, latent_dim=512,
+                 num_timesteps=1000, beta_start=1e-4, beta_end=0.02,
+                 name="TortoiseDiffusionTTS"):
+        super().__init__(name=name)
+        self.n_mels = n_mels
+        self.num_timesteps = num_timesteps
+
+        # Text encoder (shared with original)
+        self.text_encoder = Encoder(num_layers=num_layers, d_model=d_model,
+                                   num_heads=num_heads, dff=dff,
+                                   vocab_size=input_vocab_size, name="text_encoder")
+
+        # Voice autoencoder for conditioning
+        self.voice_autoencoder = VoiceAutoencoder(latent_dim=latent_dim, n_mels=n_mels)
+
+        # RVQ for mel quantization
+        self.rvq = ResidualVectorQuantizer(
+            num_quantizers=4, num_embeddings=1024, embedding_dim=n_mels
+        )
+
+        # Diffusion denoiser
+        self.denoiser = DiffusionDenoiser(
+            num_layers=num_layers, d_model=d_model, num_heads=num_heads, dff=dff, n_mels=n_mels
+        )
+
+        # Diffusion schedule (DDPM)
+        self.beta_schedule = tf.linspace(beta_start, beta_end, num_timesteps)
+        self.alpha_schedule = 1.0 - self.beta_schedule
+        self.alpha_cumprod = tf.math.cumprod(self.alpha_schedule)
+
+    def q_sample(self, x_0, t):
+        """
+        Forward diffusion process: q(x_t | x_0)
+        """
+        sqrt_alpha_cumprod = tf.sqrt(self.alpha_cumprod[t])
+        sqrt_one_minus_alpha_cumprod = tf.sqrt(1.0 - self.alpha_cumprod[t])
+
+        noise = tf.random.normal(tf.shape(x_0), dtype=x_0.dtype)
+        return sqrt_alpha_cumprod[:, None, None] * x_0 + sqrt_one_minus_alpha_cumprod[:, None, None] * noise, noise
+
+    def p_sample(self, x_t, t, text_context, voice_latents, training=False):
+        """
+        Reverse diffusion step: p(x_{t-1} | x_t)
+        """
+        predicted_noise = self.denoiser(x_t, t, text_context, voice_latents, training=training)
+
+        alpha_t = self.alpha_schedule[t]
+        alpha_cumprod_t = self.alpha_cumprod[t]
+        beta_t = self.beta_schedule[t]
+
+        sqrt_one_minus_alpha_cumprod_t = tf.sqrt(1.0 - alpha_cumprod_t)
+        sqrt_recip_alpha_t = 1.0 / tf.sqrt(alpha_t)
+
+        mean = sqrt_recip_alpha_t * (x_t - (beta_t / sqrt_one_minus_alpha_cumprod_t) * predicted_noise)
+
+        if t[0] > 0:
+            noise = tf.random.normal(tf.shape(x_t), dtype=x_t.dtype)
+            variance = beta_t
+        else:
+            noise = tf.zeros_like(x_t)
+            variance = 0.0
+
+        return mean + tf.sqrt(variance)[:, None, None] * noise
+
+    def call(self, inputs, training=False):
+        """
+        Training forward pass with diffusion.
+        """
+        mel_target = inputs["mel"]  # (B, T, n_mels)
+        text_ids = inputs["text_ids"]  # (B, S)
+        voice_mel = inputs.get("voice_mel", mel_target)  # For conditioning
+
+        # Encode text
+        text_valid = make_padding_bool(text_ids, self.text_encoder.pos_embedding.embedding.vocab_size - 1)
+        text_key_mask = key_mask_from_valid(text_valid)
+        text_context = self.text_encoder(text_ids, key_mask=text_key_mask, q_valid=text_valid, training=training)
+
+        # Voice conditioning
+        _, voice_latents = self.voice_autoencoder(voice_mel, training=training)
+
+        # RVQ quantization for target
+        quantized_mel, rvq_indices, rvq_loss, rvq_perplexity = self.rvq(mel_target)
+
+        # Diffusion training
+        t = tf.random.uniform((tf.shape(mel_target)[0],), 0, self.num_timesteps, dtype=tf.int32)
+        noisy_mel, noise = self.q_sample(quantized_mel, t)
+
+        # Denoise
+        predicted_noise = self.denoiser(noisy_mel, t, text_context, voice_latents, training=training)
+
+        # Diffusion loss
+        diffusion_loss = tf.reduce_mean((predicted_noise - noise)**2)
+
+        return {
+            "diffusion_loss": diffusion_loss,
+            "rvq_loss": rvq_loss,
+            "rvq_perplexity": rvq_perplexity,
+            "total_loss": diffusion_loss + rvq_loss
+        }
+
+    def generate(self, text_ids, voice_mel, num_steps=50, guidance_scale=1.0):
+        """
+        Generate mel using diffusion sampling with optional classifier-free guidance.
+
+        Args:
+            text_ids: Input text token IDs (B, S)
+            voice_mel: Reference voice mel for conditioning (B, T_ref, n_mels)
+            num_steps: Number of diffusion steps to use (fewer = faster but lower quality)
+            guidance_scale: Classifier-free guidance scale (1.0 = no guidance, >1.0 = more guidance)
+
+        Returns:
+            Generated mel-spectrogram (B, T, n_mels)
+        """
+        B = tf.shape(text_ids)[0]
+        T = 200  # Target mel length (can be adjusted)
+
+        # Encode text and voice
+        text_valid = make_padding_bool(text_ids, self.text_encoder.pos_embedding.embedding.vocab_size - 1)
+        text_key_mask = key_mask_from_valid(text_valid)
+        text_context = self.text_encoder(text_ids, key_mask=text_key_mask, q_valid=text_valid, training=False)
+
+        _, voice_latents = self.voice_autoencoder(voice_mel, training=False)
+
+        # Start from noise
+        x_t = tf.random.normal((B, T, self.n_mels), dtype=tf.float32)
+
+        # Reverse diffusion with optional guidance
+        for t in reversed(range(0, self.num_timesteps, self.num_timesteps // num_steps)):
+            t_tensor = tf.fill((B,), t)
+
+            if guidance_scale > 1.0:
+                # Classifier-free guidance: predict with and without conditioning
+                # For simplicity, we use unconditional prediction by zeroing text/voice
+                text_context_uncond = tf.zeros_like(text_context)
+                voice_latents_uncond = tf.zeros_like(voice_latents)
+
+                # Conditional prediction
+                x_t_cond = self.p_sample(x_t, t_tensor, text_context, voice_latents, training=False)
+
+                # Unconditional prediction
+                x_t_uncond = self.p_sample(x_t, t_tensor, text_context_uncond, voice_latents_uncond, training=False)
+
+                # Apply guidance
+                x_t = x_t_uncond + guidance_scale * (x_t_cond - x_t_uncond)
+            else:
+                # Standard sampling without guidance
+                x_t = self.p_sample(x_t, t_tensor, text_context, voice_latents, training=False)
+
+        return x_t
+
+    def generate_with_encodec(self, text_ids, voice_mel, num_steps=50, guidance_scale=1.0):
+        """
+        Generate mel and convert to audio using Encodec for high-quality output.
+
+        Returns:
+            Generated audio waveform as tf.Tensor
+        """
+        mel = self.generate(text_ids, voice_mel, num_steps, guidance_scale)
+
+        # Convert mel to audio using Encodec for better quality than Griffin-Lim
+        try:
+            from codec.encodec_codec import Encodec24k
+            encodec = Encodec24k()
+
+            # Convert normalized mel [-1,1] to audio
+            mel_norm = mel.numpy()[0]  # Remove batch dim, (T, n_mels)
+
+            # Denormalize mel to power scale
+            mel_01 = (mel_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
+            mel_db = mel_01 * 100.0 - 100.0  # -> [-100, 0] dB
+            mel_power = tf.pow(10.0, mel_db / 10.0)  # -> power
+
+            # Convert to linear spectrogram
+            n_fft = 1024  # Should match audio config
+            n_mels = self.n_mels
+            mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+                num_mel_bins=n_mels,
+                num_spectrogram_bins=n_fft // 2 + 1,
+                sample_rate=24000,  # Encodec 24kHz
+                lower_edge_hertz=0.0,
+                upper_edge_hertz=12000.0
+            )
+            linear_power = tf.matmul(mel_power, tf.linalg.pinv(mel_matrix))
+
+            # Convert to magnitude
+            mag = tf.sqrt(tf.maximum(linear_power, 1e-10))
+
+            # Griffin-Lim for initial phase reconstruction
+            wav_gl = self._griffin_lim_simple(mag.numpy(), n_iter=16)
+
+            # Re-encode with Encodec for quality enhancement
+            audio_24k = encodec.reencode_to_24k(wav_gl, input_sr=24000)
+
+            return tf.convert_to_tensor(audio_24k, dtype=tf.float32)
+
+        except ImportError:
+            print("⚠️ Encodec not available, falling back to Griffin-Lim")
+            # Fallback to Griffin-Lim
+            from MyTTSModelTrain import TensorBoardAudioLogger
+            audio_logger = TensorBoardAudioLogger(None, [], use_encodec=False)
+            audio = audio_logger._mel_to_waveform(mel.numpy()[0])
+            return audio
 
     @staticmethod
-    def shift_right_mel(mel, pad_val=0.0):
+    def _griffin_lim_simple(mag, n_iter=16):
+        """Simple Griffin-Lim for phase reconstruction."""
+        mag = tf.cast(mag, tf.float32)
+        theta = tf.random.uniform(tf.shape(mag), 0.0, 2 * np.pi, dtype=tf.float32)
+        phase = tf.complex(tf.cos(theta), tf.sin(theta))
+        S = mag * phase
+
+        for _ in range(n_iter):
+            wav = tf.signal.inverse_stft(
+                S, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
+            )
+            S = tf.signal.stft(
+                wav, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
+            )
+            angles = tf.math.angle(S)
+            phase = tf.complex(tf.cos(angles), tf.sin(angles))
+            S = mag * phase
+
+        wav_final = tf.signal.inverse_stft(
+            S, frame_length=1024, frame_step=256, window_fn=tf.signal.hann_window
+        )
+        return tf.cast(wav_final, tf.float32)
+# =========================
+# RVQ (Residual Vector Quantization)
+# =========================
+class VectorQuantizer(layers.Layer):
+    """
+    Single-layer Vector Quantizer for VQ-VAE.
+    """
+
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25, name=None):
+        super().__init__(name=name)
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+
+        # Embedding table: (num_embeddings, embedding_dim)
+        self.embeddings = self.add_weight(
+            name="embeddings",
+            shape=(num_embeddings, embedding_dim),
+            initializer="uniform",
+            trainable=True
+        )
+
+    def call(self, inputs):
+        # inputs: (B, T, D) where D == embedding_dim
+        input_shape = tf.shape(inputs)
+        flat_inputs = tf.reshape(inputs, [-1, self.embedding_dim])  # (B*T, D)
+
+        # Compute distances to embeddings
+        distances = tf.reduce_sum(flat_inputs**2, axis=1, keepdims=True) + \
+                   tf.reduce_sum(self.embeddings**2, axis=1) - \
+                   2 * tf.matmul(flat_inputs, self.embeddings, transpose_b=True)  # (B*T, num_emb)
+
+        # Find nearest embedding indices
+        encoding_indices = tf.argmin(distances, axis=1)  # (B*T,)
+        encodings = tf.one_hot(encoding_indices, self.num_embeddings)  # (B*T, num_emb)
+
+        # Quantized outputs
+        quantized = tf.matmul(encodings, self.embeddings)  # (B*T, D)
+        quantized = tf.reshape(quantized, input_shape)  # (B, T, D)
+
+        # Straight-through estimator for gradients
+        quantized_sg = inputs + tf.stop_gradient(quantized - inputs)
+
+        # Loss: commitment loss + codebook loss
+        e_latent_loss = tf.reduce_mean((tf.stop_gradient(quantized) - inputs)**2)
+        q_latent_loss = tf.reduce_mean((quantized_sg - tf.stop_gradient(quantized))**2)
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+
+        # Perplexity for monitoring
+        avg_probs = tf.reduce_mean(encodings, axis=0)
+        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10)))
+
+        return quantized_sg, encoding_indices, loss, perplexity
+
+
+class ResidualVectorQuantizer(layers.Layer):
+    """
+    Residual Vector Quantizer (RVQ) with multiple layers for better quantization.
+    Used in Tortoise TTS for mel-spectrogram quantization.
+    """
+
+    def __init__(self, num_quantizers, num_embeddings, embedding_dim, commitment_cost=0.25, name=None):
+        super().__init__(name=name)
+        self.num_quantizers = num_quantizers
+        self.quantizers = [
+            VectorQuantizer(num_embeddings, embedding_dim, commitment_cost, name=f"vq_{i}")
+            for i in range(num_quantizers)
+        ]
+
+    def call(self, inputs):
+        # inputs: (B, T, D)
+        quantized = inputs
+        total_loss = 0.0
+        all_indices = []
+        all_perplexities = []
+
+        for quantizer in self.quantizers:
+            quantized, indices, loss, perplexity = quantizer(quantized)
+            total_loss += loss
+            all_indices.append(indices)
+            all_perplexities.append(perplexity)
+
+        # Stack indices: (num_quantizers, B*T)
+        indices_stack = tf.stack(all_indices, axis=0)
+        avg_perplexity = tf.reduce_mean(tf.stack(all_perplexities))
+
+        return quantized, indices_stack, total_loss, avg_perplexity
+
+    def decode(self, indices_stack):
         """
-        Shift mel-spectrogram right by one frame for teacher forcing.
-        
-        Args:
-            mel (tf.Tensor): Mel-spectrogram of shape (batch_size, time, n_mels).
-            pad_val (float): Padding value for the first frame. Default: 0.0.
-            
-        Returns:
-            tf.Tensor: Right-shifted mel of shape (batch_size, time, n_mels).
+        Decode from stacked indices back to quantized vectors.
+        indices_stack: (num_quantizers, B*T)
         """
-        B = tf.shape(mel)[0]
-        n_mels = tf.shape(mel)[2]
-        pad = tf.fill([B, 1, n_mels], tf.cast(pad_val, mel.dtype))
-        return tf.concat([pad, mel[:, :-1, :]], axis=1)
+        B_T = tf.shape(indices_stack)[1]
+        quantized = tf.zeros((B_T, self.quantizers[0].embedding_dim), dtype=tf.float32)
 
-    @staticmethod
-    def valid_from_mel(mel, eps=1e-6):
-        """
-        Create boolean mask indicating valid (non-zero) mel frames.
-        
-        Args:
-            mel (tf.Tensor): Mel-spectrogram of shape (batch_size, time, n_mels).
-            eps (float): Threshold for considering a frame as non-zero. Default: 1e-6.
-            
-        Returns:
-            tf.Tensor: Boolean mask of shape (batch_size, time).
-        """
-        return tf.reduce_any(tf.math.abs(mel) > eps, axis=-1)  # (B,T)
+        for i, quantizer in enumerate(self.quantizers):
+            indices = indices_stack[i]  # (B*T,)
+            encodings = tf.one_hot(indices, quantizer.num_embeddings)  # (B*T, num_emb)
+            quantized += tf.matmul(encodings, quantizer.embeddings)  # (B*T, D)
 
-    def _build_masks(self, enc_ids, dec_mel, enc_len=None, mel_len=None):
-        """
-        Build attention masks for encoder and decoder.
-        
-        Args:
-            enc_ids (tf.Tensor): Encoder input IDs of shape (batch_size, src_len).
-            dec_mel (tf.Tensor): Decoder input mel of shape (batch_size, tgt_len, n_mels).
-            enc_len (tf.Tensor, optional): Encoder sequence lengths.
-            mel_len (tf.Tensor, optional): Mel sequence lengths.
-            
-        Returns:
-            tuple: (enc_valid, enc_key_mask, dec_valid, dec_causal_key) masks.
-        """
-        enc_valid = make_padding_bool(enc_ids, self.pad_id)           # (B,S)
-        enc_key_mask = key_mask_from_valid(enc_valid)                 # (B,1,S)
-
-        if mel_len is not None:
-            dec_valid = tf.sequence_mask(mel_len, maxlen=tf.shape(dec_mel)[1])  # (B,T)
-        else:
-            dec_valid = self.valid_from_mel(dec_mel)                  # (B,T)
-        dec_causal_key = combine_causal_and_keypadding(dec_valid)     # (B,T,T)
-        return enc_valid, enc_key_mask, dec_valid, dec_causal_key
-
-    def call(self, inputs, training=False, return_attn=False):
-        """
-        Forward pass for training or evaluation.
-        
-        Args:
-            inputs (tuple, list, or dict): Either (enc_ids, dec_mel) or dict with keys
-                'enc_ids', 'dec_mel', and optionally 'enc_len', 'mel_len'.
-            training (bool): Whether in training mode.
-            return_attn (bool): Whether to return attention weights.
-            
-        Returns:
-            tuple: (mel_pred_pre, mel_pred_post, stop_logits) or 
-                   (mel_pred_pre, mel_pred_post, stop_logits, attn_last) if return_attn=True.
-                   
-        Shapes:
-            mel_pred_pre: (batch_size, time, n_mels) - Pre-PostNet mel prediction
-            mel_pred_post: (batch_size, time, n_mels) - Post-PostNet refined mel
-            stop_logits: (batch_size, time, 1) - Stop token logits
-            attn_last: (batch_size, time, src_len) - Cross-attention weights (if return_attn=True)
-        """
-        if isinstance(inputs, (list, tuple)):
-            enc_ids, dec_mel = inputs
-            enc_len = None
-            mel_len = None
-        elif isinstance(inputs, dict):
-            enc_ids = inputs["enc_ids"]
-            dec_mel = inputs["dec_mel"]
-            enc_len = inputs.get("enc_len", None)
-            mel_len = inputs.get("mel_len", None)
-        else:
-            raise ValueError("inputs must be (enc_ids, dec_mel) or a dict with keys enc_ids, dec_mel")
-
-        # جایگزینی فریم آغازین با go-frame برای پایداری بیشتر
-        B = tf.shape(dec_mel)[0]
-        go = tf.cast(tf.broadcast_to(self.go_frame, [B, 1, self.n_mels]), dec_mel.dtype)
-        dec_mel = tf.concat([go, dec_mel[:, 1:, :]], axis=1)
-
-        enc_valid, enc_key_mask, dec_valid, dec_causal_key = self._build_masks(enc_ids, dec_mel, enc_len, mel_len)
-
-        enc_out = self.encoder(enc_ids, key_mask=enc_key_mask, q_valid=enc_valid, training=training)
-
-        # اگر cross_win تنظیم شده باشد، ماسک قطری (B,T,S) برای cross-attention بساز
-        if self.cross_win is not None:
-            T = tf.shape(dec_mel)[1]
-            S = tf.shape(enc_ids)[1]
-            # طول‌ها
-            if enc_len is None:
-                enc_len_val = tf.reduce_sum(tf.cast(enc_valid, tf.int32), axis=1)
-            else:
-                enc_len_val = tf.cast(enc_len, tf.int32)
-            if mel_len is None:
-                dec_len_val = tf.reduce_sum(tf.cast(dec_valid, tf.int32), axis=1)
-            else:
-                dec_len_val = tf.cast(mel_len, tf.int32)
-
-            t_idx = tf.cast(tf.range(T)[None, :, None], tf.float32)  # (1,T,1)
-            s_idx = tf.cast(tf.range(S)[None, None, :], tf.float32)  # (1,1,S)
-            t_norm = t_idx / tf.maximum(tf.cast(dec_len_val[:, None, None], tf.float32) - 1.0, 1.0)
-            s_norm = s_idx / tf.maximum(tf.cast(enc_len_val[:, None, None], tf.float32) - 1.0, 1.0)
-            allow_diag = tf.abs(t_norm - s_norm) <= tf.cast(self.cross_win, tf.float32)  # (B,T,S)
-            enc_valid_b = enc_valid[:, None, :]  # (B,1,S)
-            enc_mask_for_cross = tf.logical_and(allow_diag, enc_valid_b)  # (B,T,S)
-        else:
-            enc_mask_for_cross = enc_key_mask
-
-        dec_res = self.decoder(dec_mel, enc_out,
-                               dec_causal_key_mask=dec_causal_key,
-                               enc_key_mask=enc_mask_for_cross,
-                               q_valid=dec_valid,
-                               training=training,
-                               return_attn=return_attn)
-        if return_attn:
-            dec_out, attn_last = dec_res
-        else:
-            dec_out = dec_res
-            attn_last = None
-
-        mel_pred_pre = tf.cast(self.mel_head(dec_out), tf.float32)
-        stop_logits  = tf.cast(self.stop_head(dec_out), tf.float32)
-
-        mel_residual = tf.cast(self.postnet(mel_pred_pre, training=training), tf.float32)
-        mel_pred_post = mel_pred_pre + mel_residual
-
-        if return_attn:
-            return mel_pred_pre, mel_pred_post, stop_logits, attn_last
-        return mel_pred_pre, mel_pred_post, stop_logits
-
-    def build_for_load(self, max_src_len, max_tgt_len, dtype_ids=tf.int32, dtype_mel=tf.float32):
-        """
-        Build model with specific input shapes for loading weights.
-        
-        Args:
-            max_src_len (int): Maximum source sequence length.
-            max_tgt_len (int): Maximum target sequence length.
-            dtype_ids (tf.dtype): Data type for input IDs. Default: tf.int32.
-            dtype_mel (tf.dtype): Data type for mel-spectrogram. Default: tf.float32.
-            
-        Raises:
-            ValueError: If max_src_len or max_tgt_len exceeds max_length.
-        """
-        if max_src_len > self.max_length or max_tgt_len > self.max_length:
-            raise ValueError(f"max_src_len/max_tgt_len نباید از max_length ({self.max_length}) بزرگ‌تر باشند.")
-        enc_in = tf.keras.Input(shape=(max_src_len,), dtype=dtype_ids, name="enc_ids")
-        dec_in = tf.keras.Input(shape=(max_tgt_len, self.n_mels), dtype=dtype_mel, name="dec_mel")
-        _ = self({"enc_ids": enc_in, "dec_mel": dec_in}, training=False)
-        self.summary(expand_nested=True)
-
-    # -------- greedy inference (go-frame) --------
-    def greedy_generate_fast(self, enc_ids, *,
-                             max_steps=600, min_steps=120,
-                             stop_threshold=0.9, window=8, patience=4,
-                             check_stop_every=5, verbose=True,
-                             use_postnet=True, return_pre=False, temperature=1.0):
-        """
-        Generate mel-spectrogram autoregressively using greedy decoding with optional temperature.
-        
-        Generates mel frames one at a time starting from a learnable go-frame,
-        stopping when the model predicts high stop probability consistently.
-        
-        Args:
-            enc_ids (tf.Tensor): Encoder input IDs of shape (batch_size, src_len).
-            max_steps (int): Maximum generation steps. Default: 600.
-            min_steps (int): Minimum generation steps before checking stop condition. Default: 120.
-            stop_threshold (float): Threshold for stop probability. Default: 0.9.
-            window (int): Number of recent frames to average for stop decision. Default: 8.
-            patience (int): Number of consecutive windows above threshold before stopping. Default: 4.
-            check_stop_every (int): Check stop condition every N steps. Default: 5.
-            verbose (bool): Whether to print progress. Default: True.
-            use_postnet (bool): Whether to apply PostNet refinement. Default: True.
-            return_pre (bool): Whether to return pre-PostNet mel. Default: False.
-            temperature (float): Temperature for mel prediction sampling (1.0=greedy, >1.0=more random). Default: 1.0.
-            
-        Returns:
-            tuple: If return_pre=False → (mel_hat, stop_probs)
-                   If return_pre=True  → (mel_pre, mel_hat, stop_probs)
-                   where mel_hat is postnet output if use_postnet=True, otherwise mel_pre.
-        """
-        B = tf.shape(enc_ids)[0]
-
-        enc_valid   = make_padding_bool(enc_ids, self.pad_id)
-        enc_keymask = key_mask_from_valid(enc_valid)
-        enc_out     = self.encoder(enc_ids, key_mask=enc_keymask, q_valid=enc_valid, training=False)
-
-        # شروع با go-frame قابل یادگیری
-        mel_step   = tf.tile(self.go_frame, [B, 1, 1])
-        mel_list   = []
-        stop_list  = []
-        strike     = 0
-
-        for t in range(int(max_steps)):
-            cur_len = tf.shape(mel_step)[1]
-            dec_valid     = tf.ones([B, cur_len], dtype=tf.bool)
-            dec_causalkey = combine_causal_and_keypadding(dec_valid)
-
-            dec_h = self.decoder(mel_step, enc_out,
-                                 dec_causal_key_mask=dec_causalkey,
-                                 enc_key_mask=enc_keymask,
-                                 q_valid=dec_valid,
-                                 training=False)
-
-            mel_next_pre = tf.cast(self.mel_head(dec_h)[:, -1:, :], tf.float32)
-            
-            # Apply temperature scaling if temperature != 1.0
-            if temperature != 1.0 and temperature > 0.0:
-                # Add small noise proportional to temperature for exploration
-                noise = tf.random.normal(tf.shape(mel_next_pre), mean=0.0, stddev=0.1 * temperature, dtype=tf.float32)
-                mel_next_pre = mel_next_pre + noise
-                # Clip to valid range
-                mel_next_pre = tf.clip_by_value(mel_next_pre, -1.0, 1.0)
-            
-            stop_prob    = tf.cast(tf.sigmoid(self.stop_head(dec_h))[:, -1:, :], tf.float32)
-
-            mel_list.append(mel_next_pre)
-            stop_list.append(stop_prob)
-
-            if verbose and (t % 50 == 49):
-                tf.print("gen step", t+1, "stop~", tf.reduce_mean(stop_prob))
-
-            if (t + 1) >= min_steps and ((t + 1) % check_stop_every) == 0:
-                k = min(window, t + 1)
-                last_probs = tf.concat([tf.cast(s, tf.float32) for s in stop_list[-k:]], axis=1)
-                mean_prob  = tf.reduce_mean(last_probs, axis=1)
-                if float(tf.reduce_all(mean_prob > stop_threshold).numpy()):
-                    strike += 1
-                    if strike >= patience:
-                        if verbose: print(f"[stop @ step {t+1}]")
-                        break
-                else:
-                    strike = 0
-
-            # Ensure dtype consistency for concat operation
-            mel_step = tf.cast(mel_step, tf.float32)
-            mel_next_pre = tf.cast(mel_next_pre, tf.float32)
-            mel_step = tf.concat([mel_step, mel_next_pre], axis=1)
-
-        mel_pre  = tf.concat(mel_list, axis=1)  if mel_list  else tf.zeros([B, 0, self.n_mels], tf.float32)
-        if use_postnet:
-            mel_hat = mel_pre + tf.cast(self.postnet(mel_pre, training=False), tf.float32)
-        else:
-            mel_hat = mel_pre
-        stop_probs = tf.concat(stop_list, axis=1) if stop_list else tf.zeros([B, 0, 1], tf.float32)
-        if return_pre:
-            return mel_pre, mel_hat, stop_probs
-        return mel_hat, stop_probs
+        return quantized
