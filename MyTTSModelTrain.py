@@ -91,8 +91,23 @@ if AUDIO_METRICS_AVAILABLE:
             gt_audio = gt_audio[:min_len].astype(np.float64, copy=False)
             pred_audio = pred_audio[:min_len].astype(np.float64, copy=False)
 
+            def _resample_linear(audio, src_sr, target_sr):
+                """Lightweight linear resampler to avoid PESQ console spam at unsupported rates."""
+                if src_sr == target_sr:
+                    return audio
+                if len(audio) == 0:
+                    return audio
+                duration = len(audio) / float(src_sr)
+                target_len = max(int(round(duration * target_sr)), 1)
+                src_times = np.linspace(0.0, duration, num=len(audio), endpoint=False, dtype=np.float64)
+                target_times = np.linspace(0.0, duration, num=target_len, endpoint=False, dtype=np.float64)
+                return np.interp(target_times, src_times, audio)
+
             try:
-                pesq_val = float(pesq.pesq(24000, gt_audio, pred_audio, 'wb'))
+                pesq_sr = 16000
+                gt_audio_pesq = _resample_linear(gt_audio, 24000, pesq_sr)
+                pred_audio_pesq = _resample_linear(pred_audio, 24000, pesq_sr)
+                pesq_val = float(pesq.pesq(pesq_sr, gt_audio_pesq, pred_audio_pesq, 'wb'))
             except Exception:
                 pesq_val = 0.0
             try:
