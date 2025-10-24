@@ -476,31 +476,30 @@ class EncodecDiffusionTTS(tf.keras.Model):
         Forward diffusion process for discrete codes: q(x_t | x_0)
         Uses categorical diffusion (absorbing state diffusion).
         """
-        # For discrete codes, we use absorbing state diffusion
-        # x_0: (B, T, K) - one-hot encoded codes
+        # x_0: (B, T, K, C) - one-hot encoded codes
         # t: (B,) - timesteps
 
-        # Probability of staying unchanged
-        # Gather schedule values for the batch timesteps
-        sqrt_alpha_cumprod = tf.sqrt(tf.gather(self.alpha_cumprod, t))  # (B,)
-        sqrt_alpha_cumprod = sqrt_alpha_cumprod[:, None, None, None]  # (B, 1, 1, 1)
+        x_0 = tf.cast(x_0, tf.float32)
+        shape = tf.shape(x_0)
+        B = shape[0]
+        T = shape[1]
+        K = shape[2]
 
-        # Probability of being absorbed (noise)
-        sqrt_one_minus_alpha_cumprod = tf.sqrt(1.0 - tf.gather(self.alpha_cumprod, t))  # (B,)
-        sqrt_one_minus_alpha_cumprod = sqrt_one_minus_alpha_cumprod[:, None, None, None]  # (B, 1, 1, 1)
+        alpha_cumprod_t = tf.gather(self.alpha_cumprod, t)  # (B,)
+        alpha_cumprod_t = alpha_cumprod_t[:, None, None, None]  # (B, 1, 1, 1)
 
-        # Create noise distribution (uniform over codebook)
-        B, T, K = tf.shape(x_0)[0], tf.shape(x_0)[1], tf.shape(x_0)[2]
-        noise_dist = tf.ones((B, T, K, self.codebook_size), dtype=tf.float32) / self.codebook_size  # (B, T, K, C)
+        # Sample whether to keep original token or replace with noise
+        stay_mask = tf.cast(
+            tf.random.uniform(tf.stack([B, T, K, 1]), dtype=tf.float32) < alpha_cumprod_t,
+            dtype=x_0.dtype,
+        )
 
-        # Mix clean and noise
-        x_t_logits = tf.math.log(sqrt_alpha_cumprod * tf.cast(x_0, tf.float32) +
-                                sqrt_one_minus_alpha_cumprod * noise_dist + 1e-8)
+        noise_indices = tf.random.uniform(
+            tf.stack([B, T, K]), maxval=self.codebook_size, dtype=tf.int32
+        )
+        noise_onehot = tf.one_hot(noise_indices, self.codebook_size, dtype=x_0.dtype)
 
-        # Sample from the distribution
-        x_t = tf.random.categorical(tf.reshape(x_t_logits, (B*T*K, self.codebook_size)), num_samples=1)
-        x_t = tf.reshape(x_t, (B, T, K))
-        x_t_onehot = tf.one_hot(x_t, self.codebook_size, dtype=tf.float32)  # (B, T, K, C)
+        x_t_onehot = stay_mask * x_0 + (1.0 - stay_mask) * noise_onehot
 
         return x_t_onehot, x_0  # Return noisy codes and original for loss
 
@@ -516,6 +515,9 @@ class EncodecDiffusionTTS(tf.keras.Model):
         alpha_cumprod_t = tf.gather(self.alpha_cumprod, t)
         beta_t = tf.gather(self.beta_schedule, t)
 
+        alpha_t = alpha_t[:, None, None, None]
+        alpha_cumprod_t = alpha_cumprod_t[:, None, None, None]
+
         # Compute posterior logits
         coef1 = (1.0 - alpha_cumprod_t) / tf.sqrt(1.0 - alpha_cumprod_t + 1e-8)
         coef2 = alpha_t / tf.sqrt(1.0 - alpha_cumprod_t + 1e-8)
@@ -524,7 +526,10 @@ class EncodecDiffusionTTS(tf.keras.Model):
         posterior_logits = coef1 * predicted_logits + coef2 * tf.math.log(tf.cast(x_t, tf.float32) + 1e-8)
 
         # Sample from posterior
-        B, T, K = tf.shape(x_t)[0], tf.shape(x_t)[1], tf.shape(x_t)[2]
+        x_shape = tf.shape(x_t)
+        B = x_shape[0]
+        T = x_shape[1]
+        K = x_shape[2]
         x_t_minus_1 = tf.random.categorical(
             tf.reshape(posterior_logits, (B*T*K, self.codebook_size)), num_samples=1
         )
@@ -539,7 +544,13 @@ class EncodecDiffusionTTS(tf.keras.Model):
         """
         codes_target = inputs["codes"]  # (B, T, K) - integer codes
         text_ids = inputs["text_ids"]  # (B, S)
-        voice_codes = inputs.get("voice_codes", codes_target)  # For conditioning
+        voice_codes = inputs.get("voice_codes")
+        if voice_codes is None:
+            voice_codes = tf.zeros_like(codes_target, dtype=tf.int32)
+        else:
+            voice_codes = tf.cast(voice_codes, tf.int32)
+
+        voice_len = inputs.get("voice_len")
 
         # Convert to one-hot
         codes_onehot = tf.one_hot(codes_target, self.codebook_size, dtype=tf.float32)  # (B, T, K, C)
@@ -552,10 +563,24 @@ class EncodecDiffusionTTS(tf.keras.Model):
             text_context = block(text_context, training=training)
 
         # Encode voice (efficiently via embeddings instead of one-hot -> huge Dense)
-        # voice_codes: (B, T, K) integer indices in [0, C)
-        v_emb = self.voice_embedding(voice_codes)  # (B, T, K, E)
-        v_mean = tf.reduce_mean(v_emb, axis=[1, 2])  # (B, E)
+        # voice_codes: (B, T_ref, K) integer indices in [0, C)
+        v_emb = self.voice_embedding(voice_codes)  # (B, T_ref, K, E)
+        if voice_len is not None:
+            voice_len = tf.cast(voice_len, tf.int32)
+            max_voice_T = tf.shape(voice_codes)[1]
+            voice_mask = tf.sequence_mask(voice_len, maxlen=max_voice_T, dtype=tf.float32)  # (B, T_ref)
+            voice_mask = voice_mask[:, :, None, None]
+        else:
+            voice_mask = tf.ones_like(v_emb[:, :, :, :1], dtype=tf.float32)
+
+        voice_mask = tf.cast(voice_mask, v_emb.dtype)
+        v_emb_masked = v_emb * voice_mask
+        denom = tf.reduce_sum(voice_mask, axis=[1, 2]) + tf.cast(1e-6, v_emb.dtype)
+        v_mean = tf.reduce_sum(v_emb_masked, axis=[1, 2]) / denom  # (B, E)
         voice_latents = self.voice_proj(v_mean)  # (B, latent_dim)
+        voice_latents = tf.cast(voice_latents, tf.float32)
+
+        code_len = inputs.get("code_len")
 
         # Diffusion training
         t = tf.random.uniform((tf.shape(codes_target)[0],), 0, self.num_timesteps, dtype=tf.int32)
@@ -566,12 +591,23 @@ class EncodecDiffusionTTS(tf.keras.Model):
         predicted_logits = tf.cast(predicted_logits, tf.float32)
 
         # Diffusion loss (cross-entropy)
-        diffusion_loss = tf.reduce_mean(
-            tf.nn.softmax_cross_entropy_with_logits(
-                labels=tf.stop_gradient(clean_codes),
-                logits=predicted_logits
-            )
+        seq_mask = None
+        if code_len is not None:
+            code_len = tf.cast(code_len, tf.int32)
+            max_T = tf.shape(codes_target)[1]
+            seq_mask = tf.sequence_mask(code_len, maxlen=max_T, dtype=tf.float32)  # (B, T)
+            seq_mask = seq_mask[:, :, None]  # (B, T, 1)
+
+        ce = tf.nn.softmax_cross_entropy_with_logits(
+            labels=tf.stop_gradient(clean_codes),
+            logits=predicted_logits
         )
+        if seq_mask is not None:
+            ce = ce * seq_mask
+            total_positions = tf.reduce_sum(seq_mask) * tf.cast(self.num_codebooks, tf.float32)
+            diffusion_loss = tf.reduce_sum(ce) / (total_positions + 1e-6)
+        else:
+            diffusion_loss = tf.reduce_mean(ce)
 
         return {
             "diffusion_loss": diffusion_loss,

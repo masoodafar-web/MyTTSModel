@@ -22,6 +22,8 @@ import os
 import datetime
 import logging
 import warnings
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 import tensorflow as tf
 import numpy as np
@@ -415,6 +417,17 @@ def create_tfdata_pipeline(items, config: TrainingConfig, audio_cfg, text_cfg, t
     wav_paths = [item[0] for item in items]
     texts = [item[1] for item in items]
 
+    wav_paths_tensor = tf.constant(wav_paths)
+    num_wavs = len(wav_paths)
+
+    index_table = tf.lookup.StaticHashTable(
+        tf.lookup.KeyValueTensorInitializer(
+            wav_paths_tensor,
+            tf.range(num_wavs, dtype=tf.int32)
+        ),
+        default_value=0
+    )
+
     # Create tf.data dataset
     dataset = tf.data.Dataset.from_tensor_slices((wav_paths, texts))
 
@@ -424,7 +437,9 @@ def create_tfdata_pipeline(items, config: TrainingConfig, audio_cfg, text_cfg, t
 
     # Load and process audio/text
     dataset = dataset.map(
-        lambda wav_path, text: load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, config),
+        lambda wav_path, text: load_and_process_sample_with_voice(
+            wav_path, text, audio_cfg, text_cfg, tokenizer, config, wav_paths_tensor, num_wavs, is_training, index_table
+        ),
         num_parallel_calls=tf.data.AUTOTUNE,
         deterministic=False
     )
@@ -452,13 +467,17 @@ def create_tfdata_pipeline(items, config: TrainingConfig, audio_cfg, text_cfg, t
             'text_ids': [max_text_len],
             'codes': [None, config.num_codebooks],
             'code_len': [],
-            'text_len': []
+            'text_len': [],
+            'voice_codes': [None, config.num_codebooks],
+            'voice_len': []
         },
         padding_values={
             'text_ids': pad_id,
             'codes': tf.cast(0, tf.int32),
             'code_len': tf.cast(0, tf.int32),
-            'text_len': tf.cast(0, tf.int32)
+            'text_len': tf.cast(0, tf.int32),
+            'voice_codes': tf.cast(0, tf.int32),
+            'voice_len': tf.cast(0, tf.int32)
         },
         drop_remainder=False
     )
@@ -486,29 +505,35 @@ def load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, conf
     try:
         # Load audio
         audio_binary = tf.io.read_file(wav_path)
-        audio, sr = tf.audio.decode_wav(audio_binary, desired_channels=1, desired_samples=-1)
+        audio_wav, sr = tf.audio.decode_wav(audio_binary, desired_channels=1, desired_samples=-1)
 
-        # Resample if needed (guard tfio and use tf.cond for tensor compare)
+        # Resample if needed (guard tfio and update sample rate accordingly)
         if TFIO_AVAILABLE and tfio is not None:
             target_sr = tf.cast(audio_cfg.target_sample_rate, sr.dtype)
-            audio = tf.cond(
-                tf.not_equal(sr, target_sr),
-                lambda: tfio.audio.resample(audio, sr, target_sr),
-                lambda: audio,
-            )
+
+            def _resample():
+                resampled = tfio.audio.resample(audio_wav, sr, target_sr)
+                return resampled, target_sr
+
+            def _keep():
+                return audio_wav, sr
+
+            audio_wav, sr = tf.cond(tf.not_equal(sr, target_sr), _resample, _keep)
         else:
-            # Fallback: skip resampling if tfio not available
-            pass
+            target_sr = tf.cast(audio_cfg.target_sample_rate, sr.dtype)
+            # If tfio is unavailable, keep original sampling rate but let the encoder handle resampling.
+            audio_wav = audio_wav
 
         # Convert to float32 and squeeze
-        audio = tf.squeeze(audio, axis=-1)
+        audio = tf.squeeze(audio_wav, axis=-1)
         audio = tf.cast(audio, tf.float32)
 
         # Normalize audio
         audio = audio / (tf.reduce_max(tf.abs(audio)) + 1e-6)
 
         # Encode with Encodec (using cached tf.function)
-        codes = encodec_encode_tf(audio, config.num_codebooks, config.codebook_size)
+        cache_key = tf.convert_to_tensor(wav_path)
+        codes = encodec_encode_tf(audio, sr, config.num_codebooks, config.codebook_size, cache_key)
 
         # Tokenize text using tf.py_function, then truncate + pad to fixed length
         def _tok_py(t_bytes):
@@ -544,12 +569,13 @@ def load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, conf
         # Get lengths
         code_len = tf.shape(codes)[0]
 
-        return {
+        result = {
             'text_ids': tokens,
             'codes': codes,
             'code_len': code_len,
             'text_len': text_len,
         }
+        return result
 
     except:
         # Return a minimal valid dummy sample to keep the pipeline alive
@@ -564,25 +590,117 @@ def load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, conf
         }
 
 
-def encodec_encode_tf(audio, num_codebooks, codebook_size):
+def load_voice_reference_sample(wav_path, audio_cfg, config):
+    """Load only audio and encode to Encodec codes for voice conditioning."""
+    try:
+        audio_binary = tf.io.read_file(wav_path)
+        audio_wav, sr = tf.audio.decode_wav(audio_binary, desired_channels=1, desired_samples=-1)
+
+        if TFIO_AVAILABLE and tfio is not None:
+            target_sr = tf.cast(audio_cfg.target_sample_rate, sr.dtype)
+
+            def _resample():
+                resampled = tfio.audio.resample(audio_wav, sr, target_sr)
+                return resampled, target_sr
+
+            def _keep():
+                return audio_wav, sr
+
+            audio_wav, sr = tf.cond(tf.not_equal(sr, target_sr), _resample, _keep)
+        else:
+            target_sr = tf.cast(audio_cfg.target_sample_rate, sr.dtype)
+            audio_wav = audio_wav
+
+        audio = tf.squeeze(audio_wav, axis=-1)
+        audio = tf.cast(audio, tf.float32)
+        audio = audio / (tf.reduce_max(tf.abs(audio)) + 1e-6)
+
+        cache_key = tf.convert_to_tensor(wav_path)
+        codes = encodec_encode_tf(audio, sr, config.num_codebooks, config.codebook_size, cache_key)
+        voice_len = tf.shape(codes)[0]
+        return {
+            'voice_codes': codes,
+            'voice_len': voice_len
+        }
+    except:
+        return {
+            'voice_codes': tf.zeros([1, config.num_codebooks], dtype=tf.int32),
+            'voice_len': tf.constant(1, dtype=tf.int32)
+        }
+
+
+def load_and_process_sample_with_voice(wav_path, text, audio_cfg, text_cfg, tokenizer,
+                                       config, wav_paths_tensor, num_wavs, is_training, index_table):
+    """Wrapper to augment sample with independent voice reference codes."""
+    sample = load_and_process_sample(wav_path, text, audio_cfg, text_cfg, tokenizer, config)
+
+    if num_wavs <= 1:
+        voice_path = wav_path
+    else:
+        current_index = index_table.lookup(wav_path)
+        if is_training:
+            max_offset = num_wavs - 1
+            rand_offset = tf.random.uniform([], maxval=max_offset, dtype=tf.int32)
+            candidate_index = tf.where(rand_offset >= current_index, rand_offset + 1, rand_offset)
+            voice_index = tf.math.floormod(candidate_index, num_wavs)
+        else:
+            voice_index = tf.math.floormod(current_index + 1, num_wavs)
+        voice_path = tf.gather(wav_paths_tensor, voice_index)
+
+    voice_sample = load_voice_reference_sample(voice_path, audio_cfg, config)
+    sample['voice_codes'] = voice_sample['voice_codes']
+    sample['voice_len'] = voice_sample['voice_len']
+    return sample
+
+
+def encodec_encode_tf(audio, sample_rate, num_codebooks, codebook_size, cache_key):
     """TensorFlow-compatible Encodec encoding using tf.numpy_function for Graph compatibility."""
 
-    def _encodec_encode_py(audio_np):
+    def _encodec_encode_py(audio_np, sr_np, key_np):
         """Python function to handle Encodec encoding."""
         try:
             # Use global cached codec instance
+            cache_str = None
+            if key_np is not None:
+                if isinstance(key_np, (bytes, bytearray)):
+                    cache_str = key_np.decode('utf-8', errors='ignore')
+                elif hasattr(key_np, 'item'):
+                    cache_str = str(key_np.item())
+                else:
+                    cache_str = str(key_np)
+
+            if cache_str:
+                with _ENCODEC_CACHE_LOCK:
+                    cached = _ENCODEC_CODE_CACHE.get(cache_str)
+                    if cached is not None:
+                        _ENCODEC_CODE_CACHE.move_to_end(cache_str, last=True)
+                        return cached.copy()
+
             codec = get_encodec_singleton()
-            codes, _ = codec.encode_path_to_codes_from_array(audio_np, sr=24000)
-            return codes.astype(np.int32)
+            sr_int = int(sr_np) if not isinstance(sr_np, np.ndarray) else int(sr_np.item())
+            codes, _ = codec.encode_path_to_codes_from_array(audio_np, sr=sr_int)
+            codes = codes.astype(np.int32)
+
+            if cache_str:
+                with _ENCODEC_CACHE_LOCK:
+                    _ENCODEC_CODE_CACHE[cache_str] = codes.copy()
+                    if len(_ENCODEC_CODE_CACHE) > _MAX_ENCODEC_CACHE_ENTRIES:
+                        _ENCODEC_CODE_CACHE.popitem(last=False)
+            return codes
         except Exception as e:
             # Fallback to dummy codes if Encodec fails
             dummy_length = max(1, len(audio_np) // 320)
             return np.random.randint(0, codebook_size, (dummy_length, num_codebooks), dtype=np.int32)
 
     # Use tf.numpy_function to wrap the Python function
+    if cache_key is None:
+        cache_tensor = tf.constant("", dtype=tf.string)
+    else:
+        cache_tensor = tf.convert_to_tensor(cache_key, dtype=tf.string)
+
     codes = tf.numpy_function(
         func=_encodec_encode_py,
-        inp=[audio],
+        inp=[audio, tf.cast(sample_rate, tf.int32), cache_tensor],
         Tout=tf.int32,
         name="encodec_encode"
     )
@@ -593,6 +711,9 @@ def encodec_encode_tf(audio, num_codebooks, codebook_size):
 
 
 # Global cached Encodec instance to avoid repeated loading
+_MAX_ENCODEC_CACHE_ENTRIES = 256
+_ENCODEC_CODE_CACHE = OrderedDict()
+_ENCODEC_CACHE_LOCK = threading.Lock()
 _encodec_singleton = None
 
 def get_encodec_singleton():
@@ -1475,7 +1596,7 @@ class EncodecDiffusionLearner(tf.keras.Model):
 
     def _ensure_int_inputs(self, inputs):
         # Cast fields that are used as indices/lengths to int32
-        for k in ("text_ids", "codes", "code_len", "text_len", "voice_codes"):
+        for k in ("text_ids", "codes", "code_len", "text_len", "voice_codes", "voice_len"):
             if k in inputs:
                 inputs[k] = tf.cast(inputs[k], tf.int32)
         return inputs
